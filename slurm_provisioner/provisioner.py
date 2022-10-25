@@ -96,7 +96,9 @@ class SlurmProvisioner(KernelProvisionerBase):
 
     def read_local_storage_file(self) -> Dict:
         if not self.alloc_storage_file:
-            self.alloc_storage_file = f"{os.environ.get('HOME', '')}/.local/share/jupyter/runtime/slurm_provisioner.json"
+            home = os.environ.get("HOME", "")
+            path = f"{home}/.local/share/jupyter/runtime/slurm_provisioner.json"
+            self.alloc_storage_file = path
         try:
             with open(self.alloc_storage_file, "r") as f:
                 alloc_dict = json.load(f)
@@ -106,7 +108,9 @@ class SlurmProvisioner(KernelProvisionerBase):
 
     def write_local_storage_file(self, data) -> None:
         if not self.alloc_storage_file:
-            self.alloc_storage_file = f"{os.environ.get('HOME', '')}/.local/share/jupyter/runtime/slurm_provisioner.json"
+            home = os.environ.get("HOME", "")
+            path = f"{home}/.local/share/jupyter/runtime/slurm_provisioner.json"
+            self.alloc_storage_file = path
         with open(self.alloc_storage_file, "w") as f:
             f.write(json.dumps(data, indent=2, sort_keys=True))
 
@@ -211,8 +215,7 @@ class SlurmProvisioner(KernelProvisionerBase):
 
         # Add Slurm-JobID with it's nodelist to local user storage file
         alloc_dict = self.read_local_storage_file()
-        alloc_dict = {"kernel_ids": [], "nodelist": self.alloc_listnode}
-        alloc_dict[self.alloc_id] = alloc_dict
+        alloc_dict[self.alloc_id] = {"kernel_ids": [], "nodelist": self.alloc_listnode}
         self.write_local_storage_file(alloc_dict)
 
     async def pre_launch(self, **kwargs: Any) -> Dict[str, Any]:
