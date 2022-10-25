@@ -1,0 +1,51 @@
+#!/bin/bash
+
+while getopts ":a:p:n:g:t:r:i:" opt; do
+  case $opt in
+    a) account="$OPTARG"
+    ;;
+    p) partition="$OPTARG"
+    ;;
+    n) nodes="$OPTARG"
+    ;;
+    g) gpus="$OPTARG"
+    ;;
+    t) runtime="$OPTARG"
+    ;;
+    r) reservation="$OPTARG"
+    ;;
+    i) identifier="$OPTARG"
+    ;;
+    \?) echo "Invalid option -$OPTARG" >&2
+    exit 1
+    ;;
+  esac
+
+  case $OPTARG in
+    -*) echo "Option $opt needs a valid argument"
+    exit 1
+    ;;
+  esac
+done
+
+if [[ -z ${account} || -z ${partition} || -z ${nodes} || -z ${runtime} ]]; then
+	echo "Required arguments: account, partition, nodes, time"
+	exit 1
+fi
+
+jutil env activate -p ${account}
+
+if [[ -z ${BUDGET_ACCOUNTS} ]]; then
+	echo "Could not receive budget"
+	exit 1
+fi	
+
+cmd="salloc --no-shell -A ${BUDGET_ACCOUNTS} --partition ${partition} --nodes ${nodes} --time ${runtime} --job-name=${identifier} --begin=now"
+if [[ -n ${reservation} ]]; then
+	cmd="${cmd} --reservation ${reservation}"
+fi
+if [[ -n ${gpus} ]]; then
+  cmd="${cmd} --gres=gpu:${gpus}"
+fi
+
+$cmd

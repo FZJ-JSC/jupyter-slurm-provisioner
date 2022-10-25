@@ -1,0 +1,11 @@
+#!/bin/bash
+args=("$@")
+if [[ ${#args[@]} -lt 4 ]]; then
+	echo "At least 4 arguments are required"
+	exit 1
+fi
+jobid=${args[0]}
+node=${args[1]}
+kernelid=${args[2]}
+
+srun --jobid ${jobid} -w ${node} -N 1 --ntasks 1 --job-name ${kernelid} --exclusive ${args[@]:3} 

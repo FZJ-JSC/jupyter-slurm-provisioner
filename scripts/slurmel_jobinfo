@@ -1,0 +1,8 @@
+#!/bin/bash
+
+if [[ -z ${1} ]]; then
+	echo "Missing jobid argument"
+	exit 1
+fi
+JOBINFO=$(sacct -o jobid -n -P -s RUNNING | grep -v '\.' | grep "${1}")
+echo -n ${JOBINFO}

@@ -1,0 +1,8 @@
+#!/bin/bash
+
+if [[ -z ${1} ]]; then
+	echo "Missing jobname argument"
+	exit 1
+fi
+JOBINFO=$(sacct -o jobid,nodelist -n -P --delimiter ";;;" --name ${1} -s RUNNING)
+echo -n ${JOBINFO}
