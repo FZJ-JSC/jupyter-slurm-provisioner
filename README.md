@@ -1,5 +1,8 @@
 # Jupyter slurm provisioner
 
+## Installation
+`pip install slurm-provisioner`
+
 ## Overview
 The slurm provisioner is a subclass of [`jupyter_client.KernelProvisionerBase`](https://github.com/jupyter/jupyter_client/blob/v7.4.2/jupyter_client/provisioning/provisioner_base.py#L24). Its area of use is any slurm-based HPC system. However, it was written to be used within the Juelich Supercomputing Centre, which uses a script called `jutil` to create a user-specific environment based on a project. You may have to update `scripts/slurmel_allocate` to use it on any other HPC system.
 It allows users to start their jupyter kernel on any partition, while their notebook server is running on an interactive login node.
