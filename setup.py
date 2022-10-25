@@ -2,7 +2,7 @@ from setuptools import setup
 
 setup(
     name="slurm_provisioner",
-    version="0.1.0",
+    version="0.1.1",
     description="Jupyter slurm kernel provisioner",
     url="https://github.com/FZJ-JSC/jupyter-slurm-provisioner",
     author="Tim Kreuzer",
