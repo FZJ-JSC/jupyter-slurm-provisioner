@@ -6,6 +6,8 @@ import signal
 import socket
 import subprocess
 import uuid
+from datetime import datetime
+from datetime import timedelta
 from typing import Any
 from typing import Dict
 from typing import List
@@ -215,7 +217,14 @@ class SlurmProvisioner(KernelProvisionerBase):
 
         # Add Slurm-JobID with it's nodelist to local user storage file
         alloc_dict = self.read_local_storage_file()
-        alloc_dict[self.alloc_id] = {"kernel_ids": [], "nodelist": self.alloc_listnode}
+        alloc_dict[self.alloc_id] = {
+            "kernel_ids": [],
+            "nodelist": self.alloc_listnode,
+            "endtime": (
+                datetime.now() + timedelta(minutes=int(kernel_config["runtime"]))
+            ).timestamp(),
+            "config": kernel_config,
+        }
         self.write_local_storage_file(alloc_dict)
 
     async def pre_launch(self, **kwargs: Any) -> Dict[str, Any]:
