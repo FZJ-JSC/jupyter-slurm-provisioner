@@ -255,10 +255,13 @@ class SlurmProvisioner(KernelProvisionerBase):
             sacct_cmd = ["slurmel_jobinfo", job_id]
             job_id = subprocess.check_output(sacct_cmd).decode()
             if job_id:
-                allocate_job = False
-                self.alloc_id = job_id
-                alloc_dict = self.read_local_storage_file()
-                self.alloc_listnode = alloc_dict[self.alloc_id]["nodelist"]
+                try:
+                    allocate_job = False
+                    self.alloc_id = job_id
+                    alloc_dict = self.read_local_storage_file()
+                    self.alloc_listnode = alloc_dict[self.alloc_id]["nodelist"]
+                except:
+                    allocate_job = True                    
         if allocate_job:
             await self.allocate_slurm_job(km, kernel_config, **kwargs)
 
