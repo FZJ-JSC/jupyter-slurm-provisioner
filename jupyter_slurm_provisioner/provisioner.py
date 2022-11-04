@@ -116,6 +116,18 @@ class SlurmProvisioner(KernelProvisionerBase):
         with open(self.alloc_storage_file, "w") as f:
             f.write(json.dumps(data, indent=2, sort_keys=True))
 
+    async def kill_allocation(self, alloc_id):
+        await asyncio.sleep(30)
+        alloc_dict = self.read_local_storage_file()
+        if len(alloc_dict.get(alloc_id, {}).get("kernel_ids", [])) == 0:
+            self.log.info(f"Stop Slurmel Allocation {alloc_id}")
+            scancel_alloc_cmd = ["slurmel_cancel", str(alloc_id)]
+            subprocess.check_output(scancel_alloc_cmd)
+            alloc_dict = self.read_local_storage_file()
+            if alloc_id in alloc_dict.keys():
+                del alloc_dict[alloc_id]
+                self.write_local_storage_file(alloc_dict)
+
     async def cancel(self) -> None:
         # Remove KernelID local user storage file
         alloc_dict = self.read_local_storage_file()
@@ -127,14 +139,10 @@ class SlurmProvisioner(KernelProvisionerBase):
         scancel_kernel_cmd = ["slurmel_cancel", str(self.kernel_id)]
         subprocess.check_output(scancel_kernel_cmd)
         if len(alloc_dict.get(self.alloc_id, {}).get("kernel_ids", [])) == 0:
-            # No kernels left on alloc - kill allocation
-            self.log.info(f"Stop Slurmel Allocation {self.alloc_id}")
-            scancel_alloc_cmd = ["slurmel_cancel", str(self.alloc_id)]
-            subprocess.check_output(scancel_alloc_cmd)
-            alloc_dict = self.read_local_storage_file()
-            if self.alloc_id in alloc_dict.keys():
-                del alloc_dict[self.alloc_id]
-                self.write_local_storage_file(alloc_dict)
+            # No kernels left on alloc - kill allocation in extra task
+            # if there's another kernel for this allocation in 30 seconds it
+            # was probably just a restart and we want to reuse the allocation
+            asyncio.create_task(self.kill_allocation(self.alloc_id))
 
     async def send_signal(self, signum: int) -> None:
         if signum == signal.SIGINT or signum == signal.SIGKILL:
