@@ -256,6 +256,9 @@ class SlurmProvisioner(KernelProvisionerBase):
         )
         km.kernel_spec.argv = kernel_config["kernel_argv"]
 
+        if kernel_config.get("kernel_language", "None") != "None":
+            km.kernel_spec.language = kernel_config["kernel_language"]
+
         allocate_job = True
         if kernel_config.get("jobid", "None") != "None":
             # use preexisting jobid, do not allocate new slurm job
