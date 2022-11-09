@@ -1,4 +1,6 @@
+import logging
 import tornado
+from tornado.log import LogFormatter
 from notebook.notebookapp import NotebookApp
 
 # Update this import to reflect your package name
@@ -9,10 +11,14 @@ if __name__ == "__main__":
     notebookapp = NotebookApp()
     # Initialise config file and setup the app
     notebookapp.initialize()
+    logger = notebookapp.log
+    x = LogFormatter(fmt="%(color)s[%(levelname)1.1s %(asctime)s.%(msecs).03d %(name)s %(pathname)s:%(lineno)d]%(end_color)s %(message)s")
     
-    # Load the handlers
-    # load_jupyter_server_extension(notebookapp)
-
+    from tornado.log import LogFormatter
+    for h in logger.handlers:
+        h.formatter = x
+        # h.format = "%(color)s[%(levelname)1.1s %(asctime)s.%(msecs).03d %(name)s %(filename)s]%(end_color)s ABC %(message)s"
+    
     # Start tornado server
     notebookapp.web_app.listen(8123)
     tornado.ioloop.IOLoop.instance().start()
