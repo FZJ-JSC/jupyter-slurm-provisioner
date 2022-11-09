@@ -13,6 +13,7 @@ from typing import Dict
 from typing import List
 from typing import Optional
 from typing import Tuple
+from tornado.web import HTTPError
 
 from jupyter_client import KernelProvisionerBase
 from jupyter_client.connect import KernelConnectionInfo
@@ -117,16 +118,20 @@ class SlurmProvisioner(KernelProvisionerBase):
             f.write(json.dumps(data, indent=2, sort_keys=True))
 
     async def kill_allocation(self, alloc_id):
-        await asyncio.sleep(30)
+        await asyncio.sleep(10)
         alloc_dict = self.read_local_storage_file()
         if len(alloc_dict.get(alloc_id, {}).get("kernel_ids", [])) == 0:
             self.log.info(f"Stop Slurmel Allocation {alloc_id}")
             scancel_alloc_cmd = ["slurmel_cancel", str(alloc_id)]
-            subprocess.check_output(scancel_alloc_cmd)
-            alloc_dict = self.read_local_storage_file()
-            if alloc_id in alloc_dict.keys():
-                del alloc_dict[alloc_id]
-                self.write_local_storage_file(alloc_dict)
+            try:
+                subprocess.check_output(scancel_alloc_cmd)
+            except:
+                raise HTTPError(400, f"Could not cancel slurm allocation ( {alloc_id} ).")
+            finally:
+                alloc_dict = self.read_local_storage_file()
+                if alloc_id in alloc_dict.keys():
+                    del alloc_dict[alloc_id]
+                    self.write_local_storage_file(alloc_dict)
 
     async def cancel(self) -> None:
         # Remove KernelID local user storage file
@@ -137,12 +142,16 @@ class SlurmProvisioner(KernelProvisionerBase):
 
         self.log.info(f"Stop Slurmel Kernel {self.kernel_id}")
         scancel_kernel_cmd = ["slurmel_cancel", str(self.kernel_id)]
-        subprocess.check_output(scancel_kernel_cmd)
-        if len(alloc_dict.get(self.alloc_id, {}).get("kernel_ids", [])) == 0:
-            # No kernels left on alloc - kill allocation in extra task
-            # if there's another kernel for this allocation in 30 seconds it
-            # was probably just a restart and we want to reuse the allocation
-            asyncio.create_task(self.kill_allocation(self.alloc_id))
+        try:
+            subprocess.check_output(scancel_kernel_cmd)
+        except:
+            raise HTTPError(400, f"Could not cancel slurm jobstep on allocation {self.alloc_id}.")
+        finally:
+            if len(alloc_dict.get(self.alloc_id, {}).get("kernel_ids", [])) == 0:
+                # No kernels left on alloc - kill allocation in extra task
+                # if there's another kernel for this allocation in 30 seconds it
+                # was probably just a restart and we want to reuse the allocation
+                asyncio.create_task(self.kill_allocation(self.alloc_id))
 
     async def send_signal(self, signum: int) -> None:
         if signum == signal.SIGINT or signum == signal.SIGKILL:
@@ -192,6 +201,16 @@ class SlurmProvisioner(KernelProvisionerBase):
         return job_info.split(";;;")[0], self.nodeListToListNode(
             job_info.split(";;;")[1]
         )
+
+    async def add_allocation_to_kernel_json_file(self):
+        home = os.environ.get("HOME", "")
+        path = f"{home}/.local/share/jupyter/kernels/slurm-provisioner-kernel/kernel.json"
+        with open(path, "r") as f:
+            kernel_json = json.load(f)
+        if "config" in kernel_json.get("metadata", {}).get("kernel_provisioner", {}).keys():
+            kernel_json["metadata"]["kernel_provisioner"]["config"]["jobid"] = self.alloc_id
+        with open(path, "w") as f:
+            f.write(json.dumps(kernel_json, indent=4, sort_keys=True))
 
     async def allocate_slurm_job(self, km, kernel_config, **kwargs) -> None:
         unique_identifier = uuid.uuid4().hex
@@ -247,13 +266,18 @@ class SlurmProvisioner(KernelProvisionerBase):
         # This should be considered temporary until a better division of labor can be defined.
         km = self.parent
         if km is None:
-            raise Exception("Kernel Manager is empty.")
+            raise HTTPError(status_code=400, log_message="Could not load kernel. You should restart JupyterLab and try again.")
         self.alloc_storage_file = (
             f"{os.path.dirname(km.connection_file)}/slurm_provisioner.json"
         )
         kernel_config = km.kernel_spec.metadata.get("kernel_provisioner", {}).get(
             "config", {}
         )
+        required_keys = {"kernel_argv", "project", "partition", "nodes", "runtime"}
+        if not required_keys <= set(kernel_config.keys()):
+            error_msg = "Slurm Wrapper not configured correctly. Use \"Configure Slurm Wrapper\" before starting a kernel."
+            raise HTTPError(status_code=400, log_message=error_msg)
+
         km.kernel_spec.argv = kernel_config["kernel_argv"]
 
         if kernel_config.get("kernel_language", "None") != "None":
@@ -262,8 +286,8 @@ class SlurmProvisioner(KernelProvisionerBase):
         allocate_job = True
         if kernel_config.get("jobid", "None") != "None":
             # use preexisting jobid, do not allocate new slurm job
-            job_id = str(kernel_config.get("jobid"))
-            sacct_cmd = ["slurmel_jobinfo", job_id]
+            job_id_config = str(kernel_config.get("jobid"))
+            sacct_cmd = ["slurmel_jobinfo", job_id_config]
             job_id = subprocess.check_output(sacct_cmd).decode()
             if job_id:
                 try:
@@ -272,7 +296,9 @@ class SlurmProvisioner(KernelProvisionerBase):
                     alloc_dict = self.read_local_storage_file()
                     self.alloc_listnode = alloc_dict[self.alloc_id]["nodelist"]
                 except:
-                    allocate_job = True                    
+                    raise HTTPError(400, "Could not restart kernel. Check JupyterLab logs for more information.")
+            else:
+                raise HTTPError(400, f"Could not restart kernel. Allocation {job_id_config} is no longer running. Use \"Configure Slurm Wrapper\" to start a new allocation.")
         if allocate_job:
             await self.allocate_slurm_job(km, kernel_config, **kwargs)
 
@@ -318,15 +344,22 @@ class SlurmProvisioner(KernelProvisionerBase):
             self.node,
             km.kernel_id,
         ] + kernel_cmd
-        self.log.info(" ".join(kernel_cmd))
-        return await super().pre_launch(cmd=kernel_cmd, **kwargs)
+        # self.log.info(" ".join(kernel_cmd))
+        try:
+            ret = await super().pre_launch(cmd=kernel_cmd, **kwargs)
+        except:
+            raise HTTPError(400, "Could not allocate slurm job. The JupyterLab log contains more information.")
+        return ret
 
     async def launch_kernel(
         self, cmd: List[str], **kwargs: Any
     ) -> KernelConnectionInfo:
         # cmd is kernel.json.argv - kwargs is cwd and env
         scrubbed_kwargs = SlurmProvisioner._scrub_kwargs(kwargs)
-        self.process = launch_kernel(cmd, **scrubbed_kwargs)
+        try:
+            self.process = launch_kernel(cmd, **scrubbed_kwargs)
+        except:
+            raise HTTPError(400, "Could not start slurm jobstep on allocation. The JupyterLab log contains more information.")
 
         self.pid = self.process.pid
         return self.connection_info
