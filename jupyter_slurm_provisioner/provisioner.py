@@ -40,6 +40,13 @@ class SlurmProvisioner(KernelProvisionerBase):
     pid = None
     ports_cached = False
 
+    def get_stable_start_time(self, recommended: float = 10.0) -> float:
+        """
+        Slurm Jobs may take a long time for a start.
+        We set it to one day. This will avoid multiple starts of slurm allocations.
+        """
+        return 86400
+
     @property
     def has_process(self) -> bool:
         return self.process is not None
