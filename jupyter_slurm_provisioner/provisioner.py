@@ -40,13 +40,6 @@ class SlurmProvisioner(KernelProvisionerBase):
     pid = None
     ports_cached = False
 
-    def get_stable_start_time(self, recommended: float = 10.0) -> float:
-        """
-        Slurm Jobs may take a long time for a start.
-        We set it to one day. This will avoid multiple starts of slurm allocations.
-        """
-        return 86400
-
     @property
     def has_process(self) -> bool:
         return self.process is not None
@@ -57,7 +50,7 @@ class SlurmProvisioner(KernelProvisionerBase):
             ret = self.process.poll()
         return ret
 
-    async def wait(self) -> Optional[int]:
+    async def wait(self, set_process_none=True) -> Optional[int]:
         ret = 0
         if self.process:
             # Use busy loop at 100ms intervals, polling until the process is
@@ -74,7 +67,8 @@ class SlurmProvisioner(KernelProvisionerBase):
                 fid = getattr(self.process, attr)
                 if fid:
                     fid.close()
-            self.process = None  # allow has_process to now return False
+            if set_process_none:
+                self.process = None  # allow has_process to now return False
         return ret
 
     def nodeListToListNode(self, nodelist_str) -> List:
@@ -238,13 +232,14 @@ class SlurmProvisioner(KernelProvisionerBase):
             salloc_cmd += ["-g", kernel_config["gpus"]]
         if kernel_config.get("reservation", "None") != "None":
             salloc_cmd += ["-r", kernel_config["reservation"]]
+        
         self.process = launch_kernel(salloc_cmd, **kwargs)
 
         # Wait until salloc is finished
         self.pid = self.process.pid
-        await self.wait()
-        self.pid = None
-        self.process = None
+        ret = await self.wait(set_process_none=False)
+        if ret != 0:
+            raise HTTPError(400, "Could not allocate slurm allocation. Check JupyterLab logs for more information.")
 
         # Allocation started succesful, let's get jobid
         self.alloc_id, self.alloc_listnode = await self.get_job_id(unique_identifier)
