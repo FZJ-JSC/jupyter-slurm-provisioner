@@ -82,7 +82,7 @@ class SlurmProvisioner(KernelProvisionerBase):
         suffix = os.environ.get("SLURM_PROVISIONER_NODE_SUFFIX", "")
 
         if "[" not in nodelist_str:
-            return ["{nodelist_str}{suffix}"]
+            return [f"{nodelist_str}{suffix}"]
 
         ret = []
         prefix, all = nodelist_str.split("[")
