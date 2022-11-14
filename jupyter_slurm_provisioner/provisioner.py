@@ -77,8 +77,12 @@ class SlurmProvisioner(KernelProvisionerBase):
         # jsfc[078-079]
         # jsfc[018-029,031-049,052]
         # make a usable python list out of this
+
+        # In JSC we need the `i` suffix for internal communication
+        suffix = os.environ.get("SLURM_PROVISIONER_NODE_SUFFIX", "")
+
         if "[" not in nodelist_str:
-            return [nodelist_str]
+            return ["{nodelist_str}{suffix}"]
 
         ret = []
         prefix, all = nodelist_str.split("[")
@@ -95,7 +99,7 @@ class SlurmProvisioner(KernelProvisionerBase):
             end = int(end_s)
             len_s = len(start_s)
             for i in range(start, end + 1):
-                ret.append(f"{prefix}{str(i).zfill(len_s)}")
+                ret.append(f"{prefix}{str(i).zfill(len_s)}{suffix}")
         return ret
 
     def read_local_storage_file(self) -> Dict:
