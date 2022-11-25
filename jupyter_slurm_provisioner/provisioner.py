@@ -244,6 +244,9 @@ class SlurmProvisioner(KernelProvisionerBase):
         # Allocation started succesful, let's get jobid
         self.alloc_id, self.alloc_listnode = await self.get_job_id(unique_identifier)
 
+        # Add Allocation ID to kernel.json file. This way it's reused for the next kernel
+        await self.add_allocation_to_kernel_json_file()
+
         # Add Slurm-JobID with it's nodelist to local user storage file
         alloc_dict = self.read_local_storage_file()
         alloc_dict[self.alloc_id] = {
