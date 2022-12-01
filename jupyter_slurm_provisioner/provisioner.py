@@ -280,7 +280,7 @@ class SlurmProvisioner(KernelProvisionerBase):
         )
         required_keys = {"kernel_argv", "project", "partition", "nodes", "runtime"}
         if not required_keys <= set(kernel_config.keys()):
-            error_msg = "Slurm Wrapper not configured correctly. Use \"Configure Slurm Wrapper\" before starting a kernel."
+            error_msg = "Slurm Wrapper not configured correctly. Use the SlurmWrapper sidebar extension to configure this kernel."
             raise HTTPError(status_code=400, log_message=error_msg)
 
         km.kernel_spec.argv = kernel_config["kernel_argv"]
@@ -303,7 +303,7 @@ class SlurmProvisioner(KernelProvisionerBase):
                 except:
                     raise HTTPError(400, "Could not restart kernel. Check JupyterLab logs for more information.")
             else:
-                raise HTTPError(400, f"Could not restart kernel. Allocation {job_id_config} is no longer running. Use \"Configure Slurm Wrapper\" to start a new allocation.")
+                raise HTTPError(400, f"Could not restart kernel. Allocation {job_id_config} is no longer running. Use the SlurmWrapper sidebar extension to configure this kernel.")
         if allocate_job:
             await self.allocate_slurm_job(km, kernel_config, **kwargs)
 
