@@ -48,4 +48,4 @@ if [[ -n ${gpus} ]]; then
   cmd="${cmd} --gres=gpu:${gpus}"
 fi
 
-$cmd
+$cmd &> /dev/null &

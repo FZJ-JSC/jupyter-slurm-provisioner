@@ -1,0 +1,28 @@
+#!/bin/bash
+
+while getopts ":i:" opt; do
+  case $opt in
+    i) identifier="$OPTARG"
+    ;;
+    \?) echo "Invalid option -$OPTARG" >&2
+    exit 1
+    ;;
+  esac
+
+  case $OPTARG in
+    -*) echo "Option $opt needs a valid argument"
+    exit 1
+    ;;
+  esac
+done
+
+while true; do
+    STATE=$(sacct -o state -n -P --name ${identifier} -s RUNNING,PENDING)
+    if [[ "${STATE}" == "PENDING" ]]; then
+        sleep 5
+    elif [[ "${STATE}" == "RUNNING" ]]; then
+        exit 0
+    else
+        exit 1
+    fi
+done

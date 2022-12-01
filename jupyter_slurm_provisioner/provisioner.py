@@ -233,9 +233,24 @@ class SlurmProvisioner(KernelProvisionerBase):
         if kernel_config.get("reservation", "None") != "None":
             salloc_cmd += ["-r", kernel_config["reservation"]]
         
-        self.process = launch_kernel(salloc_cmd, **kwargs)
+        # Start allocation, do not wait for it
+        subprocess.check_output(salloc_cmd)
 
-        # Wait until salloc is finished
+        # Check for jobid, nodelist will be none
+        self.alloc_id, _ = await self.get_job_id(unique_identifier)
+        
+        # Add Allocation ID to kernel.json file. This way it's reused for the next kernel
+        await self.add_allocation_to_kernel_json_file()
+        
+        # Now we will wait here until the job is running. Then we know the nodelist etc.
+        salloc_wait_cmd = [
+            "slurmel_allocwait",
+            "-i",
+            str(unique_identifier)
+        ]
+        self.process = launch_kernel(salloc_wait_cmd, **kwargs)
+
+        # Wait until job is running, so we can check for the node list
         self.pid = self.process.pid
         ret = await self.wait(set_process_none=False)
         if ret != 0:
@@ -243,9 +258,6 @@ class SlurmProvisioner(KernelProvisionerBase):
 
         # Allocation started succesful, let's get jobid
         self.alloc_id, self.alloc_listnode = await self.get_job_id(unique_identifier)
-
-        # Add Allocation ID to kernel.json file. This way it's reused for the next kernel
-        await self.add_allocation_to_kernel_json_file()
 
         # Add Slurm-JobID with it's nodelist to local user storage file
         alloc_dict = self.read_local_storage_file()
