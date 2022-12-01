@@ -237,7 +237,7 @@ class SlurmProvisioner(KernelProvisionerBase):
         subprocess.check_output(salloc_cmd)
 
         # Check for jobid, nodelist will be none
-        self.alloc_id, _ = await self.get_job_id(unique_identifier)
+        self.alloc_id, _ = await self.get_job_id(unique_identifier, retries=40)
         
         # Add Allocation ID to kernel.json file. This way it's reused for the next kernel
         await self.add_allocation_to_kernel_json_file()

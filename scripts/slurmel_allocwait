@@ -17,12 +17,14 @@ while getopts ":i:" opt; do
 done
 
 while true; do
-    STATE=$(sacct -o state -n -P --name ${identifier} -s RUNNING,PENDING)
-    if [[ "${STATE}" == "PENDING" ]]; then
-        sleep 5
-    elif [[ "${STATE}" == "RUNNING" ]]; then
+    STATE=$(squeue -o %T -h --name ${identifier})
+    if [[ "${STATE}" == "RUNNING" ]]; then
         exit 0
-    else
+    elif [[ "${STATE}" == "CANCELLED" ]]; then
         exit 1
+    elif [[ "${STATE}" == "FAILED" ]]; then
+        exit 1
+    else
+        sleep 5
     fi
 done
