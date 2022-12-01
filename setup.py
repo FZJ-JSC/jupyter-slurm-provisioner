@@ -23,8 +23,10 @@ setup(
         ]
     },
     scripts=[
+        "scripts/slurm_watch",
         "scripts/slurmel_allocate",
         "scripts/slurmel_allocinfo",
+        "scripts/slurmel_allocwait",
         "scripts/slurmel_cancel",
         "scripts/slurmel_jobinfo",
         "scripts/slurmel_kernel_start",
