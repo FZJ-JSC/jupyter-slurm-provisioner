@@ -242,6 +242,16 @@ class SlurmProvisioner(KernelProvisionerBase):
         # Add Allocation ID to kernel.json file. This way it's reused for the next kernel
         await self.add_allocation_to_kernel_json_file()
         
+        # Add Slurm-JobID with empty nodelist to local user storage file
+        alloc_dict = self.read_local_storage_file()
+        alloc_dict[self.alloc_id] = {
+            "kernel_ids": [self.kernel_id],
+            "nodelist": [],
+            "endtime": None,
+            "config": kernel_config,
+        }
+        self.write_local_storage_file(alloc_dict)
+
         # Now we will wait here until the job is running. Then we know the nodelist etc.
         salloc_wait_cmd = [
             "slurmel_allocwait",
@@ -262,7 +272,7 @@ class SlurmProvisioner(KernelProvisionerBase):
         # Add Slurm-JobID with it's nodelist to local user storage file
         alloc_dict = self.read_local_storage_file()
         alloc_dict[self.alloc_id] = {
-            "kernel_ids": [],
+            "kernel_ids": [self.kernel_id],
             "nodelist": self.alloc_listnode,
             "endtime": (
                 datetime.now() + timedelta(minutes=int(kernel_config["runtime"]))
@@ -386,8 +396,9 @@ class SlurmProvisioner(KernelProvisionerBase):
     async def post_launch(self, **kwargs: Any) -> None:
         # Add KernelID to local user storage file
         alloc_dict = self.read_local_storage_file()
-        alloc_dict[self.alloc_id]["kernel_ids"].append(self.kernel_id)
-        self.write_local_storage_file(alloc_dict)
+        if self.kernel_id not in alloc_dict[self.alloc_id]["kernel_ids"]:
+            alloc_dict[self.alloc_id]["kernel_ids"].append(self.kernel_id)
+            self.write_local_storage_file(alloc_dict)
         return await super().post_launch(**kwargs)
 
     @staticmethod
