@@ -49,3 +49,4 @@ if [[ -n ${gpus} ]]; then
 fi
 
 $cmd &> /dev/null &
+echo $!
