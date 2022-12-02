@@ -1,0 +1,28 @@
+#!/usr/bin/env python
+
+import json
+import os
+import sys
+
+
+if len(sys.argv) < 3:
+  print("Not enough arguments")
+  exit(1)
+
+jobid = sys.argv[1]
+state = sys.argv[2]
+
+home = os.environ.get("HOME", "")
+path = f"{home}/.local/share/jupyter/runtime/slurm_provisioner.json"
+try:
+  with open(path, "r") as f:
+    data = json.load(f)
+except:
+  data = {}
+
+if jobid not in data.keys():
+  data[jobid] = {}
+data[jobid]["state"] = state
+
+with open(path, "w") as f:
+  f.write(json.dumps(data, indent=2, sort_keys=True))

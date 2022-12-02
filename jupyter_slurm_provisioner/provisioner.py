@@ -234,7 +234,7 @@ class SlurmProvisioner(KernelProvisionerBase):
             salloc_cmd += ["-r", kernel_config["reservation"]]
         
         # Start allocation, do not wait for it
-        salloc_pid = subprocess.check_output(salloc_cmd)
+        subprocess.check_output(salloc_cmd)
 
         # Check for jobid, nodelist will be none
         self.alloc_id, _ = await self.get_job_id(unique_identifier, retries=40)
@@ -249,7 +249,7 @@ class SlurmProvisioner(KernelProvisionerBase):
             "nodelist": [],
             "endtime": None,
             "config": kernel_config,
-            "pid": salloc_pid,
+            "state": "PENDING"
         }
         self.write_local_storage_file(alloc_dict)
 

@@ -16,8 +16,15 @@ while getopts ":i:" opt; do
   esac
 done
 
+JOBID=$(squeue -o %i -h --name ${identifier})
+PRESTATE=$(squeue -o %T -h --name ${identifier})
+slurmel_update_state "${JOBID}" "${PRESTATE}"
+
 while true; do
     STATE=$(squeue -o %T -h --name ${identifier})
+    if [[ ! "${STATE}" == "${PRESTATE}" ]]; then
+        slurmel_update_state "${JOBID}" "${STATE}"
+    fi
     if [[ "${STATE}" == "RUNNING" ]]; then
         exit 0
     elif [[ "${STATE}" == "CANCELLED" ]]; then

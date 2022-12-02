@@ -30,5 +30,6 @@ setup(
         "scripts/slurmel_cancel",
         "scripts/slurmel_jobinfo",
         "scripts/slurmel_kernel_start",
+        "scripts/slurmel_update_state",
     ],
 )
