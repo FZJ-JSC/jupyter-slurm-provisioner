@@ -1,8 +1,10 @@
 #!/bin/bash
 
-if [[ -z ${1} ]]; then
-    echo "Missing jobname argument"
-    exit 1
+args=("$@")
+if [[ ${#args[@]} -lt 1 ]]; then
+        echo "At least 1 argument is required"
+        exit 1
 fi
-JOBID=$(squeue -o %i -h --name ${1})
+jobname=${args[0]}
+JOBID=$(sacct -s RUNNING -o jobid,jobname -P -n --delimiter ';' | grep "${jobname}" | cut -d';' -f 1)
 scancel ${JOBID} || true

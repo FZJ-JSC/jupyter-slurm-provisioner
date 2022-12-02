@@ -273,7 +273,7 @@ class SlurmProvisioner(KernelProvisionerBase):
         # Add Slurm-JobID with it's nodelist to local user storage file
         alloc_dict = self.read_local_storage_file()
         alloc_dict[self.alloc_id]["nodelist"] = self.alloc_listnode
-        alloc_dict[self.alloc_id]["endtime"] = datetime.now() + timedelta(minutes=int(kernel_config["runtime"]))
+        alloc_dict[self.alloc_id]["endtime"] = ( datetime.now() + timedelta(minutes=int(kernel_config["runtime"])) ).timestamp()
         alloc_dict[self.alloc_id]["pid"] = None
         self.write_local_storage_file(alloc_dict)
 
