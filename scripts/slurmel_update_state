@@ -20,9 +20,7 @@ try:
 except:
   data = {}
 
-if jobid not in data.keys():
-  data[jobid] = {}
-data[jobid]["state"] = state
-
-with open(path, "w") as f:
-  f.write(json.dumps(data, indent=2, sort_keys=True))
+if jobid in data.keys():
+  data[jobid]["state"] = state
+  with open(path, "w") as f:
+    f.write(json.dumps(data, indent=2, sort_keys=True))
