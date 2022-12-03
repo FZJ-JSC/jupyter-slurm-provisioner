@@ -18,11 +18,21 @@ done
 
 JOBID=$(squeue -o %i -h --name ${identifier})
 PRESTATE=$(squeue -o %T -h --name ${identifier})
+if [[ "${PRESTATE}" == "" ]]; then
+    sleep 5
+    PRESTATE=$(squeue -o %T -h --name ${identifier})
+fi
+if [[ "${PRESTATE}" == "" ]]; then
+    echo "Could not check job status"
+    exit 1
+fi
+
 slurmel_update_state "${JOBID}" "${PRESTATE}"
 
 while true; do
     STATE=$(squeue -o %T -h --name ${identifier})
     if [[ ! "${STATE}" == "${PRESTATE}" ]]; then
+        PRESTATE=${STATE}
         slurmel_update_state "${JOBID}" "${STATE}"
     fi
     if [[ "${STATE}" == "RUNNING" ]]; then
@@ -30,6 +40,8 @@ while true; do
     elif [[ "${STATE}" == "CANCELLED" ]]; then
         exit 1
     elif [[ "${STATE}" == "FAILED" ]]; then
+        exit 1
+    elif [[ "${STATE}" == "" ]]; then
         exit 1
     else
         sleep 5
