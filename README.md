@@ -52,9 +52,3 @@ Configure a kernel.json file in your `$HOME`. It is not recommended to define th
     }
 }
 ```
-
-## Restart behavior
-Whenever you stop the last kernel on an existing slurm allocation, this allocation will be relinquished.
-This is also the case if you "restart" the last/only kernel on this allocation.
-
-To avoid an unwanted lost of an allocation, you might want to start a second kernel on your allocation, using the `jobid` configuration.
