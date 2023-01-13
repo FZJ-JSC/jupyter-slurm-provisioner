@@ -8,7 +8,7 @@ except Exception:
 
 setup(
     name="jupyter-slurm-provisioner",
-    version="0.5.0",
+    version="0.5.0a2",
     description="Jupyter slurm kernel provisioner",
     url="https://github.com/FZJ-JSC/jupyter-slurm-provisioner",
     author="Tim Kreuzer",

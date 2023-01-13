@@ -156,6 +156,8 @@ class SlurmProvisioner(KernelProvisionerBase):
             f.write(json.dumps(data, indent=2, sort_keys=True))
 
     async def kill_allocation(self, alloc_id):
+        if alloc_id is None:
+            return
         await asyncio.sleep(10)
         alloc_dict = self.read_local_storage_file()
         if len(alloc_dict.get(alloc_id, {}).get("kernel_ids", [])) == 0:
@@ -174,6 +176,8 @@ class SlurmProvisioner(KernelProvisionerBase):
                     self.write_local_storage_file(alloc_dict)
 
     async def cancel(self) -> None:
+        if self.alloc_id is None:
+            return
         # Remove KernelID local user storage file
         alloc_dict = self.read_local_storage_file()
         if self.kernel_id in alloc_dict.get(self.alloc_id, {}).get("kernel_ids", []):
@@ -248,6 +252,8 @@ class SlurmProvisioner(KernelProvisionerBase):
         )
 
     async def add_allocation_to_kernel_json_file(self):
+        if self.alloc_id is None:
+            return
         home = os.environ.get("HOME", "")
         path = (
             f"{home}/.local/share/jupyter/kernels/slurm-provisioner-kernel/kernel.json"
@@ -288,10 +294,10 @@ class SlurmProvisioner(KernelProvisionerBase):
         subprocess.check_output(salloc_cmd)
 
         # Check for jobid, nodelist will be none
-        self.alloc_id, _ = await self.get_job_id(unique_identifier, retries=40)
-        if not self.alloc_id:
-            # Error during get_job_id occured. Will be called by KernelManager
+        ret1, _ = await self.get_job_id(unique_identifier, retries=40)
+        if ret is None:
             return
+        self.alloc_id = ret1
 
         # Add Allocation ID to kernel.json file. This way it's reused for the next kernel
         await self.add_allocation_to_kernel_json_file()
@@ -321,10 +327,11 @@ class SlurmProvisioner(KernelProvisionerBase):
             return
 
         # Allocation started succesful, let's get jobid
-        self.alloc_id, self.alloc_listnode = await self.get_job_id(unique_identifier)
-        if self.alloc_id is None:
-            # Error during get_job_id occured. Will be called by KernelManager
+        ret1, ret2 = await self.get_job_id(unique_identifier)
+        if ret1 is None:
             return
+        self.alloc_id = ret1
+        self.alloc_listnode = ret2
 
         # Add Slurm-JobID with it's nodelist to local user storage file
         alloc_dict = self.read_local_storage_file()
@@ -400,7 +407,8 @@ class SlurmProvisioner(KernelProvisionerBase):
             await self.allocate_slurm_job(km, kernel_config, **kwargs)
             if "error_msg" in km.kernel_spec.metadata.keys():
                 return {"cmd": "None"}
-
+        if self.alloc_id is None:
+            return {"cmd": "None"}
         kernel_config["jobid"] = self.alloc_id
 
         if kernel_config.get("node", "None") != "None":
@@ -476,6 +484,8 @@ class SlurmProvisioner(KernelProvisionerBase):
         return self.connection_info
 
     async def post_launch(self, **kwargs: Any) -> None:
+        if self.alloc_id is None:
+            return
         if "error_msg" in self.parent.kernel_spec.metadata.keys():
             # do nothing.
             return
