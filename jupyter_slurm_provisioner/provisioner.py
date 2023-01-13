@@ -39,13 +39,11 @@ class CustomAsyncMappingKernelManager(AsyncMappingKernelManager):
 
     async def restart_kernel(self, kernel_id, now=False):
         await self.async_check_for_error(kernel_id)
-        self.log.info("++++++ super restart_kernel")
         ret = await super().restart_kernel(kernel_id, now=now)
         return ret
 
     def kernel_model(self, kernel_id):
         self.check_for_error(kernel_id)
-        self.log.info("++++++ super kernel model")
         return super().kernel_model(kernel_id)
 
     use_pending_kernels = True
