@@ -13,12 +13,42 @@ from typing import Dict
 from typing import List
 from typing import Optional
 from typing import Tuple
-from tornado.web import HTTPError
 
 from jupyter_client import KernelProvisionerBase
 from jupyter_client.connect import KernelConnectionInfo
 from jupyter_client.connect import LocalPortCache
 from jupyter_client.launcher import launch_kernel
+from jupyter_server.services.kernels.kernelmanager import AsyncMappingKernelManager
+from tornado import web
+
+
+class CustomAsyncMappingKernelManager(AsyncMappingKernelManager):
+    async def async_check_for_error(self, kernel_id):
+        self._check_kernel_id(kernel_id)
+        if "error_msg" in self._kernels[kernel_id].kernel_spec.metadata.keys():
+            raise web.HTTPError(
+                400, self._kernels[kernel_id].kernel_spec.metadata["error_msg"]
+            )
+
+    def check_for_error(self, kernel_id):
+        self._check_kernel_id(kernel_id)
+        if "error_msg" in self._kernels[kernel_id].kernel_spec.metadata.keys():
+            raise web.HTTPError(
+                400, self._kernels[kernel_id].kernel_spec.metadata["error_msg"]
+            )
+
+    async def restart_kernel(self, kernel_id, now=False):
+        await self.async_check_for_error(kernel_id)
+        self.log.info("++++++ super restart_kernel")
+        ret = await super().restart_kernel(kernel_id, now=now)
+        return ret
+
+    def kernel_model(self, kernel_id):
+        self.check_for_error(kernel_id)
+        self.log.info("++++++ super kernel model")
+        return super().kernel_model(kernel_id)
+
+    use_pending_kernels = True
 
 
 class SlurmProvisioner(KernelProvisionerBase):
@@ -29,6 +59,15 @@ class SlurmProvisioner(KernelProvisionerBase):
     functional parity to existing applications by launching the kernel via
     slurm and using :class:`subprocess.Popen` with bash scripts to manage its
     lifecycle.
+    """
+
+    """
+    This KernelProvisioner should be used with the pending kernel option, because
+    it might take a long time until a slurm job is up and running.
+    https://jupyter-client.readthedocs.io/en/stable/pending-kernels.html
+    We should not throw exceptions in any of the pre_launch, launch_kernel
+    or post_launch functions. These errors are ignored anyway.
+    Instead we have to make sure, that these exceptions will be raised in .wait().
     """
 
     alloc_id = None
@@ -122,12 +161,14 @@ class SlurmProvisioner(KernelProvisionerBase):
         await asyncio.sleep(10)
         alloc_dict = self.read_local_storage_file()
         if len(alloc_dict.get(alloc_id, {}).get("kernel_ids", [])) == 0:
-            self.log.info(f"Stop Slurmel Allocation {alloc_id}")
+            self.log.debug(f"Stop Slurmel Allocation {alloc_id}")
             scancel_alloc_cmd = ["slurmel_cancel", str(alloc_id)]
             try:
                 subprocess.check_output(scancel_alloc_cmd)
             except:
-                raise HTTPError(400, f"Could not cancel slurm allocation ( {alloc_id} ).")
+                error_msg = f"Could not cancel slurm allocation ( {alloc_id} )."
+                self.parent.kernel_spec.metadata["error_msg"] = error_msg
+                raise web.HTTPError(400, error_msg)
             finally:
                 alloc_dict = self.read_local_storage_file()
                 if alloc_id in alloc_dict.keys():
@@ -141,12 +182,14 @@ class SlurmProvisioner(KernelProvisionerBase):
             alloc_dict[self.alloc_id]["kernel_ids"].remove(self.kernel_id)
         self.write_local_storage_file(alloc_dict)
 
-        self.log.info(f"Stop Slurmel Kernel {self.kernel_id}")
+        self.log.debug(f"Stop Slurmel Kernel {self.kernel_id}")
         scancel_kernel_cmd = ["slurmel_cancel", str(self.kernel_id)]
         try:
             subprocess.check_output(scancel_kernel_cmd)
         except:
-            raise HTTPError(400, f"Could not cancel slurm jobstep on allocation {self.alloc_id}.")
+            error_msg = f"Could not cancel slurm jobstep on allocation {self.alloc_id}."
+            self.parent.kernel_spec.metadata["error_msg"] = error_msg
+            raise web.HTTPError(400, error_msg)
         finally:
             if len(alloc_dict.get(self.alloc_id, {}).get("kernel_ids", [])) == 0:
                 # No kernels left on alloc - kill allocation in extra task
@@ -205,11 +248,18 @@ class SlurmProvisioner(KernelProvisionerBase):
 
     async def add_allocation_to_kernel_json_file(self):
         home = os.environ.get("HOME", "")
-        path = f"{home}/.local/share/jupyter/kernels/slurm-provisioner-kernel/kernel.json"
+        path = (
+            f"{home}/.local/share/jupyter/kernels/slurm-provisioner-kernel/kernel.json"
+        )
         with open(path, "r") as f:
             kernel_json = json.load(f)
-        if "config" in kernel_json.get("metadata", {}).get("kernel_provisioner", {}).keys():
-            kernel_json["metadata"]["kernel_provisioner"]["config"]["jobid"] = self.alloc_id
+        if (
+            "config"
+            in kernel_json.get("metadata", {}).get("kernel_provisioner", {}).keys()
+        ):
+            kernel_json["metadata"]["kernel_provisioner"]["config"][
+                "jobid"
+            ] = self.alloc_id
         with open(path, "w") as f:
             f.write(json.dumps(kernel_json, indent=4, sort_keys=True))
 
@@ -232,16 +282,16 @@ class SlurmProvisioner(KernelProvisionerBase):
             salloc_cmd += ["-g", kernel_config["gpus"]]
         if kernel_config.get("reservation", "None") != "None":
             salloc_cmd += ["-r", kernel_config["reservation"]]
-        
+
         # Start allocation, do not wait for it
         subprocess.check_output(salloc_cmd)
 
         # Check for jobid, nodelist will be none
         self.alloc_id, _ = await self.get_job_id(unique_identifier, retries=40)
-        
+
         # Add Allocation ID to kernel.json file. This way it's reused for the next kernel
         await self.add_allocation_to_kernel_json_file()
-        
+
         # Add Slurm-JobID with empty nodelist to local user storage file
         alloc_dict = self.read_local_storage_file()
         alloc_dict[self.alloc_id] = {
@@ -249,23 +299,22 @@ class SlurmProvisioner(KernelProvisionerBase):
             "nodelist": [],
             "endtime": None,
             "config": kernel_config,
-            "state": "PENDING"
+            "state": "PENDING",
         }
         self.write_local_storage_file(alloc_dict)
 
         # Now we will wait here until the job is running. Then we know the nodelist etc.
-        salloc_wait_cmd = [
-            "slurmel_allocwait",
-            "-i",
-            str(unique_identifier)
-        ]
+        salloc_wait_cmd = ["slurmel_allocwait", "-i", str(unique_identifier)]
         self.process = launch_kernel(salloc_wait_cmd, **kwargs)
 
         # Wait until job is running, so we can check for the node list
         self.pid = self.process.pid
         ret = await self.wait(set_process_none=False)
         if ret != 0:
-            raise HTTPError(400, "Could not allocate slurm allocation. Check JupyterLab logs for more information.")
+            km.kernel_spec.metadata[
+                "error_msg"
+            ] = "Could not allocate slurm allocation. Check JupyterLab logs for more information."
+            return
 
         # Allocation started succesful, let's get jobid
         self.alloc_id, self.alloc_listnode = await self.get_job_id(unique_identifier)
@@ -273,7 +322,9 @@ class SlurmProvisioner(KernelProvisionerBase):
         # Add Slurm-JobID with it's nodelist to local user storage file
         alloc_dict = self.read_local_storage_file()
         alloc_dict[self.alloc_id]["nodelist"] = self.alloc_listnode
-        alloc_dict[self.alloc_id]["endtime"] = ( datetime.now() + timedelta(minutes=int(kernel_config["runtime"])) ).timestamp()
+        alloc_dict[self.alloc_id]["endtime"] = (
+            datetime.now() + timedelta(minutes=int(kernel_config["runtime"]))
+        ).timestamp()
         alloc_dict[self.alloc_id]["pid"] = None
         self.write_local_storage_file(alloc_dict)
 
@@ -289,7 +340,15 @@ class SlurmProvisioner(KernelProvisionerBase):
         # This should be considered temporary until a better division of labor can be defined.
         km = self.parent
         if km is None:
-            raise HTTPError(status_code=400, log_message="Could not load kernel. You should restart JupyterLab and try again.")
+            raise web.HTTPError(
+                status_code=400,
+                log_message="Could not load kernel. You should restart JupyterLab and try again.",
+            )
+
+        # Remove errors from previous attempts
+        if "error_msg" in km.kernel_spec.metadata.keys():
+            del km.kernel_spec.metadata["error_msg"]
+
         self.alloc_storage_file = (
             f"{os.path.dirname(km.connection_file)}/slurm_provisioner.json"
         )
@@ -298,8 +357,10 @@ class SlurmProvisioner(KernelProvisionerBase):
         )
         required_keys = {"kernel_argv", "project", "partition", "nodes", "runtime"}
         if not required_keys <= set(kernel_config.keys()):
-            error_msg = "Slurm Wrapper not configured correctly. Use the SlurmWrapper sidebar extension to configure this kernel."
-            raise HTTPError(status_code=400, log_message=error_msg)
+            km.kernel_spec.metadata[
+                "error_msg"
+            ] = "Slurm Wrapper not configured correctly. Use the SlurmWrapper sidebar extension to configure this kernel."
+            return {"cmd": "None"}
 
         km.kernel_spec.argv = kernel_config["kernel_argv"]
 
@@ -319,11 +380,19 @@ class SlurmProvisioner(KernelProvisionerBase):
                     alloc_dict = self.read_local_storage_file()
                     self.alloc_listnode = alloc_dict[self.alloc_id]["nodelist"]
                 except:
-                    raise HTTPError(400, "Could not restart kernel. Check JupyterLab logs for more information.")
+                    km.kernel_spec.metadata[
+                        "error_msg"
+                    ] = "Could not restart kernel. Check JupyterLab logs for more information."
+                    return {"cmd": "None"}
             else:
-                raise HTTPError(400, f"Could not restart kernel. Allocation {job_id_config} is no longer running. Use the SlurmWrapper sidebar extension to configure this kernel.")
+                km.kernel_spec.metadata[
+                    "error_msg"
+                ] = f"Allocation {job_id_config} is no longer running. You have to start a new kernel. Use the SlurmWrapper sidebar extension to configure it properly."
+                return {"cmd": "None"}
         if allocate_job:
             await self.allocate_slurm_job(km, kernel_config, **kwargs)
+            if "error_msg" in km.kernel_spec.metadata.keys():
+                return {"cmd": "None"}
 
         kernel_config["jobid"] = self.alloc_id
 
@@ -373,26 +442,41 @@ class SlurmProvisioner(KernelProvisionerBase):
         try:
             ret = await super().pre_launch(cmd=kernel_cmd, **kwargs)
         except:
-            raise HTTPError(400, "Could not allocate slurm job. The JupyterLab log contains more information.")
+            km.kernel_spec.metadata[
+                "error_msg"
+            ] = "Could not allocate slurm job. The JupyterLab log contains more information."
+            return {"cmd": "None"}
         return ret
 
     async def launch_kernel(
         self, cmd: List[str], **kwargs: Any
     ) -> KernelConnectionInfo:
         # cmd is kernel.json.argv - kwargs is cwd and env
+        if "error_msg" in self.parent.kernel_spec.metadata.keys():
+            # do nothing. The error will be thrown in self.wait()
+            return self.connection_info
+
         scrubbed_kwargs = SlurmProvisioner._scrub_kwargs(kwargs)
         try:
             self.process = launch_kernel(cmd, **scrubbed_kwargs)
         except:
-            raise HTTPError(400, "Could not start slurm jobstep on allocation. The JupyterLab log contains more information.")
+            raise web.HTTPError(
+                400,
+                "Could not start slurm jobstep on allocation. The JupyterLab log contains more information.",
+            )
 
         self.pid = self.process.pid
         return self.connection_info
 
     async def post_launch(self, **kwargs: Any) -> None:
+        if "error_msg" in self.parent.kernel_spec.metadata.keys():
+            # do nothing.
+            return
         # Add KernelID to local user storage file
         alloc_dict = self.read_local_storage_file()
-        if self.kernel_id not in alloc_dict[self.alloc_id]["kernel_ids"]:
+        if self.alloc_id and self.kernel_id not in alloc_dict.get(
+            self.alloc_id, {}
+        ).get("kernel_ids", []):
             alloc_dict[self.alloc_id]["kernel_ids"].append(self.kernel_id)
             self.write_local_storage_file(alloc_dict)
         return await super().post_launch(**kwargs)
