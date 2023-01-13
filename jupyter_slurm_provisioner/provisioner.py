@@ -238,7 +238,10 @@ class SlurmProvisioner(KernelProvisionerBase):
             c += 1
 
         if not job_info:
-            raise Exception("Could not receive Job ID for salloc cmd")
+            self.parent.kernel_spec.metadata[
+                "error_msg"
+            ] = "Could not receive Job ID for salloc cmd"
+            return None, None
 
         return job_info.split(";;;")[0], self.nodeListToListNode(
             job_info.split(";;;")[1]
@@ -286,6 +289,9 @@ class SlurmProvisioner(KernelProvisionerBase):
 
         # Check for jobid, nodelist will be none
         self.alloc_id, _ = await self.get_job_id(unique_identifier, retries=40)
+        if not self.alloc_id:
+            # Error during get_job_id occured. Will be called by KernelManager
+            return
 
         # Add Allocation ID to kernel.json file. This way it's reused for the next kernel
         await self.add_allocation_to_kernel_json_file()
@@ -316,6 +322,9 @@ class SlurmProvisioner(KernelProvisionerBase):
 
         # Allocation started succesful, let's get jobid
         self.alloc_id, self.alloc_listnode = await self.get_job_id(unique_identifier)
+        if self.alloc_id is None:
+            # Error during get_job_id occured. Will be called by KernelManager
+            return
 
         # Add Slurm-JobID with it's nodelist to local user storage file
         alloc_dict = self.read_local_storage_file()
