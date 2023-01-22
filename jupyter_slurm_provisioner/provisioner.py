@@ -2,51 +2,59 @@ import asyncio
 import json
 import os
 import random
+import re
 import signal
 import socket
 import subprocess
 import uuid
 from datetime import datetime
 from datetime import timedelta
-from typing import Any
-from typing import Dict
-from typing import List
-from typing import Optional
-from typing import Tuple
 
+import requests
 from jupyter_client import KernelProvisionerBase
-from jupyter_client.connect import KernelConnectionInfo
 from jupyter_client.connect import LocalPortCache
-from jupyter_client.launcher import launch_kernel
+from jupyter_client.launcher import launch_kernel as start_popen
+from jupyter_client.utils import ensure_async
 from jupyter_server.services.kernels.kernelmanager import AsyncMappingKernelManager
-from tornado import web
+from traitlets import DottedObjectName
 
 
-class CustomAsyncMappingKernelManager(AsyncMappingKernelManager):
-    async def async_check_for_error(self, kernel_id):
-        self._check_kernel_id(kernel_id)
-        if "error_msg" in self._kernels[kernel_id].kernel_spec.metadata.keys():
-            raise web.HTTPError(
-                400, self._kernels[kernel_id].kernel_spec.metadata["error_msg"]
-            )
-
-    def check_for_error(self, kernel_id):
-        self._check_kernel_id(kernel_id)
-        if "error_msg" in self._kernels[kernel_id].kernel_spec.metadata.keys():
-            raise web.HTTPError(
-                400, self._kernels[kernel_id].kernel_spec.metadata["error_msg"]
-            )
-
-    async def restart_kernel(self, kernel_id, now=False):
-        await self.async_check_for_error(kernel_id)
-        ret = await super().restart_kernel(kernel_id, now=now)
-        return ret
-
-    def kernel_model(self, kernel_id):
-        self.check_for_error(kernel_id)
-        return super().kernel_model(kernel_id)
-
+class SlurmAsyncMappingKernelManager(AsyncMappingKernelManager):
     use_pending_kernels = True
+
+    async def _async_shutdown_kernel(self, kernel_id, now=False, restart=False):
+        # If Kernel is up and running: use the default shutdown function.
+        # If it's still pending: cancel start and remove it, once it's cancelled.
+        km = self.get_kernel(kernel_id)
+        if km and isinstance(km.provisioner, SlurmProvisioner) and not km.ready.done():
+            if kernel_id in self._pending_kernels:
+                fut = self._pending_kernels[kernel_id]
+                fut.cancel()
+            stopper = ensure_async(km.shutdown_kernel(now, False))
+            fut = asyncio.ensure_future(
+                self._remove_kernel_when_ready(kernel_id, stopper)
+            )
+            self._pending_kernels[kernel_id] = fut
+        else:
+            await super()._async_shutdown_kernel(kernel_id, now, restart)
+
+    async def interrupt_kernel(self, kernel_id):
+        # If Kernel is up and running: use the default interrupt function.
+        # If it's still pending: cancel start and remove it, once it's cancelled.
+        km = self.get_kernel(kernel_id)
+        if km and isinstance(km.provisioner, SlurmProvisioner) and not km.ready.done():
+            if kernel_id in self._pending_kernels:
+                fut = self._pending_kernels[kernel_id]
+                fut.cancel()
+            stopper = ensure_async(km.shutdown_kernel(True, False))
+            fut = asyncio.ensure_future(
+                self._remove_kernel_when_ready(kernel_id, stopper)
+            )
+            self._pending_kernels[kernel_id] = fut
+        else:
+            await super().interrupt_kernel(kernel_id)
+
+    shutdown_kernel = _async_shutdown_kernel
 
 
 class SlurmProvisioner(KernelProvisionerBase):
@@ -55,95 +63,63 @@ class SlurmProvisioner(KernelProvisionerBase):
     :py:class:`KernelProvisionerBase` and is used when "slurm-provisioner" is
     specified in the kernel specification (``kernel.json``).  It provides
     functional parity to existing applications by launching the kernel via
-    slurm and using :class:`subprocess.Popen` with bash scripts to manage its
-    lifecycle.
+    slurm and using :class:`subprocess.Popen` to manage its lifecycle.
     """
 
-    """
-    This KernelProvisioner should be used with the pending kernel option, because
-    it might take a long time until a slurm job is up and running.
-    https://jupyter-client.readthedocs.io/en/stable/pending-kernels.html
-    We should not throw exceptions in any of the pre_launch, launch_kernel
-    or post_launch functions. These errors are ignored anyway.
-    Instead we have to make sure, that these exceptions will be raised in .wait().
-    """
+    slurm_allocation_id = None
+    slurm_allocation_name = None
+    slurm_allocation_nodelist = []
+    slurm_allocation_node = None
+    slurm_allocation_endtime = None
+    slurm_jobstep_id = None
 
-    alloc_id = None
-    alloc_listnode = []
-    alloc_storage_file = ""
-    node = ""
+    alloc_storage_file = None
 
-    process = None
-    pid = None
+    state = ""
+    kernel_config = {}
     ports_cached = False
 
-    @property
-    def has_process(self) -> bool:
-        return self.process is not None
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
 
-    async def poll(self) -> Optional[int]:
-        ret = 0
-        if self.process:
-            if self.process == "wait_for_kill":
-                return 1
-            ret = self.process.poll()
-        return ret
+        # This storage file is used by the frontend extension
+        home = os.environ.get("HOME", "")
+        path = f"{home}/.local/share/jupyter/runtime/slurm_provisioner.json"
+        self.alloc_storage_file = path
 
-    async def wait(self, set_process_none=True) -> Optional[int]:
-        ret = 0
-        if self.process:
-            if self.process == "wait_for_kill":
-                return 0
-            # Use busy loop at 100ms intervals, polling until the process is
-            # not alive.  If we find the process is no longer alive, complete
-            # its cleanup via the blocking wait().  Callers are responsible for
-            # issuing calls to wait() using a timeout (see kill()).
-            while await self.poll() is None:
-                await asyncio.sleep(0.1)
+        # Should never be the case. But the official provisioners check these ..
+        if self.parent is None:
+            raise Exception(
+                "Could not start kernel. Check JupyterLab logs for more information."
+            )
 
-            # Process is no longer alive, wait and clear
-            ret = self.process.wait()
-            # Make sure all the fds get closed.
-            for attr in ["stdout", "stderr", "stdin"]:
-                fid = getattr(self.process, attr)
-                if fid:
-                    fid.close()
-            if set_process_none:
-                self.process = None  # allow has_process to now return False
-        return ret
+        # this is the configuration given in kernel.json. Configured via frontend extension
+        self.kernel_config = self.parent.kernel_spec.metadata.get(
+            "kernel_provisioner", {}
+        ).get("config", {})
 
-    def nodeListToListNode(self, nodelist_str) -> List:
-        # sacct shows nodelist like this:
-        # jsfc078
-        # jsfc[078-079]
-        # jsfc[018-029,031-049,052]
-        # make a usable python list out of this
-        if "[" not in nodelist_str:
-            return [nodelist_str]
+        # We need at least these configuration. For everything else we'll use default values.
+        required_keys = {"kernel_argv", "project", "partition", "nodes", "runtime"}
+        if not required_keys <= set(self.kernel_config.keys()):
+            raise Exception(
+                "Slurm Wrapper not configured correctly. Use the Slurm Wrapper sidebar extension to configure this kernel."
+            )
 
-        ret = []
-        prefix, all = nodelist_str.split("[")
-        all = all.rstrip("]")
-        blocks = all.split(",")
-        for block in blocks:
-            block_s = block.split("-")
-            start_s = block_s[0]
-            if len(block_s) == 2:
-                end_s = block_s[1]
-            else:
-                end_s = start_s
-            start = int(start_s)
-            end = int(end_s)
-            len_s = len(start_s)
-            for i in range(start, end + 1):
-                ret.append(f"{prefix}{str(i).zfill(len_s)}")
-        return ret
+        # Originally kernel_spec.argv is the unix process to start a kernel.
+        # We will run these commands with `srun`
+        self.parent.kernel_spec.argv = self.kernel_config["kernel_argv"]
 
-    def read_local_storage_file(self) -> Dict:
-        if not self.alloc_storage_file:
-            home = os.environ.get("HOME", "")
-            path = f"{home}/.local/share/jupyter/runtime/slurm_provisioner.json"
-            self.alloc_storage_file = path
+        # kernel language can be changed. Depending on the kernel that will be started
+        if self.kernel_config.get("kernel_language", "None") != "None":
+            self.parent.kernel_spec.language = self.kernel_config["kernel_language"]
+
+        # If we want to reuse an allocation, we have to know its id
+        self.slurm_allocation_id = self.kernel_config.get("jobid", None)
+
+    # The following storage / update function are used store specific kernel information
+    # that will be used by the frontend extension
+
+    def read_local_storage_file(self):
         try:
             with open(self.alloc_storage_file, "r") as f:
                 alloc_dict = json.load(f)
@@ -151,81 +127,569 @@ class SlurmProvisioner(KernelProvisionerBase):
             alloc_dict = {}
         return alloc_dict
 
-    def write_local_storage_file(self, data) -> None:
-        if not self.alloc_storage_file:
-            home = os.environ.get("HOME", "")
-            path = f"{home}/.local/share/jupyter/runtime/slurm_provisioner.json"
-            self.alloc_storage_file = path
-        with open(self.alloc_storage_file, "w") as f:
-            f.write(json.dumps(data, indent=2, sort_keys=True))
-
-    async def kill_allocation(self, alloc_id):
-        if alloc_id is None:
-            return
-        await asyncio.sleep(10)
-        alloc_dict = self.read_local_storage_file()
-        if len(alloc_dict.get(alloc_id, {}).get("kernel_ids", [])) == 0:
-            self.log.debug(f"Stop Slurmel Allocation {alloc_id}")
-            scancel_alloc_cmd = ["slurmel_cancel", str(alloc_id)]
-            try:
-                subprocess.check_output(scancel_alloc_cmd)
-            except:
-                error_msg = f"Could not cancel slurm allocation ( {alloc_id} )."
-                self.parent.kernel_spec.metadata["error_msg"] = error_msg
-                raise web.HTTPError(400, error_msg)
-            finally:
-                alloc_dict = self.read_local_storage_file()
-                if alloc_id in alloc_dict.keys():
-                    del alloc_dict[alloc_id]
-                    self.write_local_storage_file(alloc_dict)
-
-    async def cancel(self) -> None:
-        if self.alloc_id is None:
-            return
-        # Remove KernelID local user storage file
-        alloc_dict = self.read_local_storage_file()
-        if self.kernel_id in alloc_dict.get(self.alloc_id, {}).get("kernel_ids", []):
-            alloc_dict[self.alloc_id]["kernel_ids"].remove(self.kernel_id)
-        self.write_local_storage_file(alloc_dict)
-
-        self.log.debug(f"Stop Slurmel Kernel {self.kernel_id}")
-        scancel_kernel_cmd = ["slurmel_cancel", str(self.kernel_id)]
+    def write_local_storage_file(self, data):
         try:
-            subprocess.check_output(scancel_kernel_cmd)
+            with open(self.alloc_storage_file, "w") as f:
+                f.write(json.dumps(data, indent=2, sort_keys=True))
         except:
-            error_msg = f"Could not cancel slurm jobstep on allocation {self.alloc_id}."
-            self.parent.kernel_spec.metadata["error_msg"] = error_msg
-            raise web.HTTPError(400, error_msg)
+            os.makedirs(os.path.dirname(self.alloc_storage_file), exist_ok=True)
+            with open(self.alloc_storage_file, "w") as f:
+                f.write(json.dumps(data, indent=2, sort_keys=True))
+
+    def update_alloc_storage_status(self, status):
+        alloc_storage = self.read_local_storage_file()
+        alloc_storage[self.slurm_allocation_id]["state"] = status
+        self.write_local_storage_file(alloc_storage)
+
+    def update_alloc_storage_nodelist_endtime(self):
+        self.slurm_allocation_endtime = (
+            datetime.now() + timedelta(minutes=int(self.kernel_config["runtime"]))
+        ).timestamp()
+        alloc_storage = self.read_local_storage_file()
+        alloc_storage[self.slurm_allocation_id][
+            "nodelist"
+        ] = self.slurm_allocation_nodelist
+        alloc_storage[self.slurm_allocation_id][
+            "endtime"
+        ] = self.slurm_allocation_endtime
+        self.write_local_storage_file(alloc_storage)
+
+    def update_alloc_storage_add_kernel_id(self):
+        alloc_storage = self.read_local_storage_file()
+        if self.kernel_id not in alloc_storage[self.slurm_allocation_id]["kernel_ids"]:
+            alloc_storage[self.slurm_allocation_id]["kernel_ids"].append(self.kernel_id)
+        self.write_local_storage_file(alloc_storage)
+
+    def update_alloc_storage_del_kernel_id(self):
+        alloc_storage = self.read_local_storage_file()
+        if self.kernel_id in alloc_storage[self.slurm_allocation_id]["kernel_ids"]:
+            alloc_storage[self.slurm_allocation_id]["kernel_ids"].remove(self.kernel_id)
+        self.write_local_storage_file(alloc_storage)
+
+    def update_alloc_storage_del_allocation(self, alloc_id):
+        alloc_storage = self.read_local_storage_file()
+        if alloc_id in alloc_storage.keys():
+            del alloc_storage[alloc_id]
+        self.write_local_storage_file(alloc_storage)
+
+    def update_alloc_storage_init_allocation(self):
+        # Ensure allocation is part of alloc_storage file
+        alloc_storage = self.read_local_storage_file()
+        if self.slurm_allocation_id not in alloc_storage.keys():
+            alloc_storage[self.slurm_allocation_id] = {
+                "kernel_ids": [],
+                "nodelist": [],
+                "endtime": None,
+                "config": self.kernel_config,
+                "state": "PENDING",
+            }
+        self.write_local_storage_file(alloc_storage)
+
+    @property
+    def has_process(self):
+        """
+        Returns true if this provisioner is currently managing a process.
+
+        This property is asserted to be True immediately following a call to
+        the provisioner's :meth:`launch_kernel` method.
+        """
+        return self.state and self.state not in ["FINISHED", "FAILED"]
+
+    async def poll(self):
+        """
+        Checks if kernel process is still running.
+
+        If running, None is returned, otherwise the process's integer-valued exit code is returned.
+        This method is called from :meth:`KernelManager.is_alive`.
+        """
+        if self.state in ["FINISHED", "FAILED"]:
+            return 1
+        else:
+            if (
+                self.slurm_allocation_endtime
+                and datetime.now().timestamp() > self.slurm_allocation_endtime
+            ):
+                # Allocation ran out of time. Call self.kill() to update storage file correctly
+                self.log.debug(
+                    "Allocation {self.slurm_allocation_id} ran out of time. Update storage files. Return 1"
+                )
+                await self.kill()
+                return 1
+            else:
+                return None
+
+    async def wait(self, grace_period_sec=10):
+        """
+        Waits for kernel process to terminate.
+
+        This method is called from `KernelManager.finish_shutdown()` and
+        `KernelManager.kill_kernel()` when terminating a kernel gracefully or
+        immediately, respectively.
+        """
+        c = 0
+        for i in range(grace_period_sec):
+            if self.state in ["FINISHED", "FAILED"]:
+                return
+            await asyncio.sleep(1)
+
+    async def send_signal(self, signum):
+        """
+        Sends signal identified by signum to the kernel process.
+
+        This method is called from `KernelManager.signal_kernel()` to send the
+        kernel process a signal.
+        """
+        if signum == 0:
+            return await self.poll()
+        elif signum in [signal.SIGKILL, signal.SIGINT]:
+            return await self.kill()
+        return
+
+    async def slurm_stop_jobstep(self):
+        # Kill kernel, but do not stop allocation
+        # Remove kernel_id from storage file
+        scancel_cmd = ["scancel", self.slurm_jobstep_id]
+        try:
+            subprocess.check_output(scancel_cmd)
         finally:
-            if len(alloc_dict.get(self.alloc_id, {}).get("kernel_ids", [])) == 0:
-                # No kernels left on alloc - kill allocation in extra task
-                # if there's another kernel for this allocation in 30 seconds it
-                # was probably just a restart and we want to reuse the allocation
-                asyncio.create_task(self.kill_allocation(self.alloc_id))
+            self.update_alloc_storage_del_kernel_id()
 
-    async def send_signal(self, signum: int) -> None:
-        if signum == signal.SIGINT or signum == signal.SIGKILL:
-            await self.cancel()
+    async def slurm_stop_allocation(self, alloc_id):
+        # Check if something's still running on this allocation
+        # Do not use self.slurm_allocation_id - this might be deleted
+        # within the next 10 seconds.
+        await asyncio.sleep(10)
+        sacct_cmd = [
+            "sacct",
+            "-o",
+            "jobid",
+            "-n",
+            "--delimiter",
+            ";",
+            "-P",
+            "-s",
+            "RUNNING,PENDING",
+        ]
+        all_jobs_list = subprocess.check_output(sacct_cmd).decode().strip().split("\n")
+        all_jobs_in_alloc = [x for x in all_jobs_list if x.startswith(alloc_id)]
+        if len(all_jobs_in_alloc) == 0:
+            # allocation alloc_id is not running/pending
+            pass
+        elif len(all_jobs_in_alloc) > 1:
+            # There are still job_steps running on this alloc_id.
+            # Do not cancel this allocation
+            pass
+        else:
+            # No Jobstep running on this allocation - kill it
+            scancel_cmd = ["scancel", alloc_id]
+            subprocess.check_output(scancel_cmd)
+            self.update_alloc_storage_del_allocation(alloc_id)
 
-    async def kill(self, restart: bool = False) -> None:
-        await self.cancel()
+    async def kill(self, restart=False):
+        """
+        Kill the kernel process.
 
-    async def terminate(self, restart: bool = False) -> None:
-        await self.cancel()
+        This is typically accomplished via a SIGKILL signal, which cannot be caught.
+        This method is called from `KernelManager.kill_kernel()` when terminating
+        a kernel immediately.
 
-    @staticmethod
-    def _tolerate_no_process(os_error: OSError) -> None:
-        # On Unix, we may get an ESRCH error (or ProcessLookupError instance) if
-        # the process has already terminated. Ignore it.
-        from errno import ESRCH
+        restart is True if this operation will precede a subsequent launch_kernel request.
+        """
+        # even if restart is true, we're still checking for running kernels on allocation
+        # after 10 seconds. If a kernel restart would fail, the allocation might be running
+        # for a long time.
 
-        if not isinstance(os_error, ProcessLookupError) or os_error.errno != ESRCH:
-            raise
+        try:
+            if self.slurm_salloc_process:
+                # If it's currently allocating slurm resources: kill this process
+                self.slurm_salloc_process.kill()
+        except:
+            self.log.exception("Could not kill allocation process")
+        try:
+            if self.slurm_launch_kernel_process:
+                # If it's currently allocating slurm resources: kill this process
+                self.slurm_launch_kernel_process.kill()
+                # Make sure all the fds get closed.
+                for attr in ["stdout", "stderr", "stdin"]:
+                    fid = getattr(self.slurm_launch_kernel_process, attr)
+                    if fid:
+                        fid.close()
+                self.slurm_launch_kernel_process = None
+        except:
+            self.log.exception("Could not kill launch kernel process")
 
-    async def cleanup(self, restart: bool = False) -> None:
-        if self.ports_cached and not restart:
-            # provisioner is about to be destroyed, return cached ports
-            lpc = LocalPortCache.instance()
+        try:
+            if self.slurm_jobstep_id:
+                # scancel command if jobstep id exists
+                await self.slurm_stop_jobstep()
+        finally:
+            try:
+                if self.slurm_allocation_id:
+                    # scancel command if allocation id exists ; and no jobsteps are running on it
+                    asyncio.create_task(
+                        self.slurm_stop_allocation(self.slurm_allocation_id)
+                    )
+            finally:
+                self.state = "FINISHED"
+
+    async def terminate(self, restart=False):
+        """
+        Terminates the kernel process.
+
+        This is typically accomplished via a SIGTERM signal, which can be caught, allowing
+        the kernel provisioner to perform possible cleanup of resources.  This method is
+        called indirectly from `KernelManager.finish_shutdown()` during a kernel's
+        graceful termination.
+
+        restart is True if this operation precedes a start launch_kernel request.
+        """
+        await self.kill(restart)
+
+    async def pre_launch(self, **kwargs):
+        # ensure that an allocation is up and running
+        self.state = "PRE_LAUNCH"
+        ret = await super().pre_launch(**kwargs)
+        ret["cmd"] = None
+        return ret
+
+    async def slurm_verify_allocation(self):
+        # If an slurm_allocation_id is given via config,
+        # we verify that it's running (or pending) and
+        # store the jobname
+        sacct_cmd = [
+            "sacct",
+            "-o",
+            "jobid,jobname",
+            "-n",
+            "--delimiter",
+            ";",
+            "-P",
+            "-s",
+            "RUNNING,PENDING",
+        ]
+        all_jobs_raw = subprocess.check_output(sacct_cmd).decode().strip()
+        all_jobs_tuples = [x.split(";") for x in all_jobs_raw.split("\n")]
+        slurm_jobs_name_list = [
+            x[1] for x in all_jobs_tuples if x[0] == self.slurm_allocation_id
+        ]
+        self.slurm_allocation_name = (
+            slurm_jobs_name_list[0] if slurm_jobs_name_list else None
+        )
+        if not self.slurm_allocation_name:
+            raise Exception(
+                f"Allocation {self.slurm_allocation_id} is not running. Shutdown or interrupt this kernel and start a new kernel afterwards. Use the SlurmWrapper sidebar extension to configure it properly."
+            )
+
+        # Ensure it's stored in storage file
+        self.update_alloc_storage_init_allocation()
+        self.slurm_allocation_nodelist = self.kernel_config["nodelist"]
+        self.slurm_allocation_endtime = self.kernel_config["endtime"]
+
+    async def slurm_allocate(self):
+        # start slurm allocation
+        # Do not run anything on it yet
+        get_budget_account_cmd = [
+            "/usr/libexec/jutil-exe",
+            "env",
+            "activate",
+            "-p",
+            self.kernel_config["project"],
+        ]
+        try:
+            get_budget_account_output = (
+                subprocess.check_output(get_budget_account_cmd).decode().strip()
+            )
+        except Exception as e:
+            raise e
+        jutil_vars = {
+            x.group(1): x.group(2)
+            for x in re.finditer(r"export\ ([^=]+)=([^;]+)", get_budget_account_output)
+        }
+
+        self.slurm_allocation_name = uuid.uuid4().hex
+        salloc_cmd = [
+            "salloc",
+            "--no-shell",
+            "--account",
+            str(jutil_vars["BUDGET_ACCOUNTS"]),
+            "--partition",
+            str(self.kernel_config["partition"]),
+            "--nodes",
+            str(self.kernel_config["nodes"]),
+            "--time",
+            str(self.kernel_config["runtime"]),
+            "--job-name",
+            str(self.slurm_allocation_name),
+            "--begin",
+            "now",
+        ]
+        if self.kernel_config.get("gpus", "0") not in ["0", "", None]:
+            salloc_cmd += [f"--gres=gpu:{self.kernel_config['gpus']}"]
+        if self.kernel_config.get("reservation", "None") != "None":
+            salloc_cmd += ["--reservation", str(self.kernel_config["reservation"])]
+
+        self.slurm_salloc_process = start_popen(salloc_cmd)
+        exit_code = self.slurm_salloc_process.wait()
+        # Make sure all the fds get closed.
+        for attr in ["stdout", "stderr", "stdin"]:
+            fid = getattr(self.slurm_salloc_process, attr)
+            if fid:
+                fid.close()
+        self.slurm_salloc_process = None
+        if exit_code != 0:
+            raise Exception(
+                "Could not create slurm allocation. Check JupyterLab logs for more information."
+            )
+
+        # Get JobID for defined job-name
+        squeue_cmd = [
+            "squeue",
+            "-o",
+            "%i",
+            "-h",
+            "--name",
+            str(self.slurm_allocation_name),
+        ]
+        self.slurm_allocation_id = subprocess.check_output(squeue_cmd).decode().strip()
+
+        # Ensure it's stored in storage file
+        self.update_alloc_storage_init_allocation()
+
+    async def slurm_allocation_running(self):
+        # Wait for slurm allocation until it's running
+        squeue_cmd = [
+            "squeue",
+            "-o",
+            "%T",
+            "-h",
+            "--name",
+            str(self.slurm_allocation_name),
+        ]
+        unknown_allocation = False
+        prev_state = ""
+        while True:
+            slurm_allocation_status = (
+                subprocess.check_output(squeue_cmd).decode().strip()
+            )
+            if not slurm_allocation_status:
+                if unknown_allocation:
+                    # second time no allocation; let's cancel this
+                    raise Exception(
+                        f"Allocation {self.slurm_allocation_id} is not running. Shutdown or interrupt this kernel and start a new kernel afterwards. Use the SlurmWrapper sidebar extension to configure it properly."
+                    )
+                else:
+                    # No state means no allocation with this name available. Wait for 10 seconds and try again
+                    unknown_allocation = True
+                    await asyncio.sleep(10)
+                    continue
+
+            if prev_state != slurm_allocation_status:
+                self.update_alloc_storage_status(slurm_allocation_status)
+                prev_state = slurm_allocation_status
+
+            unknown_allocation = False
+            if slurm_allocation_status == "RUNNING":
+                # If it's up and running, we can go on and start a kernel on this allocation
+                break
+            elif slurm_allocation_status in ["CANCELLED", "FAILED"]:
+                # That's not good. Abort kernel launch
+                raise Exception(
+                    f"Allocation {self.slurm_allocation_id} is not running. Shutdown or interrupt this kernel and start a new kernel afterwards. Use the SlurmWrapper sidebar extension to configure it properly."
+                )
+            else:
+                # Check again in 5 seconds
+                await asyncio.sleep(5)
+
+    async def slurm_allocation_store_nodelist(self):
+        sacct_cmd = [
+            "sacct",
+            "-o",
+            "nodelist",
+            "-n",
+            "-P",
+            "-s",
+            "RUNNING,PENDING",
+            "--name",
+            str(self.slurm_allocation_name),
+        ]
+        nodelist_raw = subprocess.check_output(sacct_cmd).decode().strip()
+        # sacct shows nodelist like this:
+        # jsfc078
+        # jsfc[078-079]
+        # jsfc[018-029,031-049,052]
+        # make a usable python list out of this
+        if "[" not in nodelist_raw:
+            self.slurm_allocation_nodelist = [nodelist_raw]
+        else:
+            self.slurm_allocation_nodelist = []
+            prefix, all_numbers = nodelist_raw.split("[")
+            all_numbers = all_numbers.rstrip("]")
+            all_numbers_blocks = all_numbers.split(",")
+            for block in all_numbers_blocks:
+                block_s = block.split("-")
+                start_s = block_s[0]
+                if len(block_s) == 2:
+                    end_s = block_s[1]
+                else:
+                    end_s = start_s
+                start = int(start_s)
+                end = int(end_s)
+                len_s = len(start_s)
+                for i in range(start, end + 1):
+                    self.slurm_allocation_nodelist.append(
+                        f"{prefix}{str(i).zfill(len_s)}"
+                    )
+
+        self.update_alloc_storage_nodelist_endtime()
+
+    async def slurm_launch_kernel(self, **kwargs):
+        km = self.parent
+        extra_arguments = kwargs.pop("extra_arguments", [])
+        kernel_cmd = km.format_kernel_cmd(extra_arguments=extra_arguments)
+        self.slurm_allocation_node = random.choice(self.slurm_allocation_nodelist)
+        srun_cmd = [
+            "srun",
+            "--jobid",
+            self.slurm_allocation_id,
+            "-w",
+            self.slurm_allocation_node,
+            "-N",
+            "1",
+            "--ntasks",
+            "1",
+            "--job-name",
+            self.kernel_id,
+            "--exclusive",
+        ] + kernel_cmd
+        self.slurm_launch_kernel_process = start_popen(srun_cmd)
+        self.update_alloc_storage_add_kernel_id()
+
+    async def set_connection_info(self):
+        # Starting a kernel on a compute node, nearly all ports are free.
+        # If there's something else running on this compute node, we cannot
+        # check it at this stage. But we can ensure, that multiple kernels
+        # on one allocation do not impede each other
+        lpc = LocalPortCache.instance()
+        km = self.parent
+        km.ip = "127.0.0.1"
+        km.shell_port = lpc.find_available_port(km.ip)
+        km.iopub_port = lpc.find_available_port(km.ip)
+        km.stdin_port = lpc.find_available_port(km.ip)
+        km.hb_port = lpc.find_available_port(km.ip)
+        km.control_port = lpc.find_available_port(km.ip)
+        self.ports_cached = True
+        # For some networks you have to use a suffix for internal communication
+        suffix = os.environ.get("SLURM_PROVISIONER_NODE_SUFFIX", "")
+        km.ip = socket.gethostbyname(f"{self.slurm_allocation_node}{suffix}")
+        km.write_connection_file()
+        self.connection_info = km.get_connection_info()
+
+    async def launch_kernel(self, cmd, **kwargs):
+        """
+        Launch the kernel process and return its connection information.
+
+        This method is called from `KernelManager.launch_kernel()` during the
+        kernel manager's start kernel sequence.
+        """
+        try:
+            if (
+                not self.slurm_allocation_id
+            ) or self.slurm_allocation_id.lower() == "none":
+                await self.slurm_allocate()
+            else:
+                await self.slurm_verify_allocation()
+            await self.slurm_allocation_running()
+            await self.slurm_allocation_store_nodelist()
+        except Exception as e:
+            self.log.exception("Exception in pre_launch")
+            self.state = "FAILED"
+            raise Exception(str(e))
+
+        self.state = "LAUNCH"
+        try:
+            await self.slurm_launch_kernel()
+            await self.set_connection_info()
+        except Exception as e:
+            self.log.exception("Excpetion in launch_kernel.")
+            self.state = "FAILED"
+            raise Exception(str(e))
+
+        return self.connection_info
+
+    async def slurm_set_jobstep_id(self):
+        sacct_cmd = [
+            "sacct",
+            "-o",
+            "jobid,jobname",
+            "-n",
+            "--delimiter",
+            ";",
+            "-P",
+            "-s",
+            "RUNNING",
+            "--name",
+            str(self.slurm_allocation_name),
+        ]
+        all_steps_raw = subprocess.check_output(sacct_cmd).decode().strip()
+        all_steps_tuples = [x.split(";") for x in all_steps_raw.split("\n")]
+        slurm_jobstep_id_list = [
+            x[0] for x in all_steps_tuples if x[1] == self.kernel_id
+        ]
+        self.slurm_jobstep_id = (
+            slurm_jobstep_id_list[0] if slurm_jobstep_id_list else None
+        )
+
+    async def send_metric_to_jhub(self):
+        jhub_metrics_url = os.environ.get("SLURM_PROVISIONER_JHUB_METRICS", "")
+        jhub_token = os.environ.get("JUPYTERHUB_API_TOKEN", "")
+        if jhub_metrics_url and jhub_token:
+            body = {
+                "kernel_id": self.kernel_id,
+                "slurm_allocation_id": self.slurm_allocation_id,
+                "slurm_allocation_name": self.slurm_allocation_name,
+                "slurm_allocation_nodelist": self.slurm_allocation_nodelist,
+                "slurm_allocation_node": self.slurm_allocation_node,
+                "slurm_allocation_endtime": self.slurm_allocation_endtime,
+                "slurm_jobstep_id": self.slurm_jobstep_id,
+                "config": self.kernel_config,
+            }
+            headers = {"Authorization": f"token {jhub_token}"}
+            self.log.info("Send metrics to JupyterHub", extra=body)
+            ca_path = os.environ.get("JUPYTERHUB_CERTIFICATE", False)
+            with requests.post(
+                jhub_metrics_url, json=body, headers=headers, verify=ca_path
+            ) as r:
+                r.raise_for_status()
+
+    async def post_launch(self, **kwargs):
+        self.state = "POST_LAUNCH"
+        try:
+            await self.slurm_set_jobstep_id()
+        except Exception as e:
+            self.log.exception("Excpetion in post_launch.")
+            self.state = "FAILED"
+            raise Exception(str(e))
+        try:
+            await self.send_metric_to_jhub()
+        except:
+            self.log.warning(
+                "Could not send metric to JupyterHub. Start Kernel anyway",
+                exc_info=True,
+            )
+
+        self.state = "RUNNING"
+
+    async def cleanup(self, restart=False):
+        """
+        Cleanup any resources allocated on behalf of the kernel provisioner.
+
+        This method is called from `KernelManager.cleanup_resources()` as part of
+        its shutdown kernel sequence.
+
+        restart is True if this operation precedes a start launch_kernel request.
+        """
+        lpc = LocalPortCache.instance()
+        if "shell_port" in self.connection_info:
             ports = (
                 self.connection_info["shell_port"],
                 self.connection_info["iopub_port"],
@@ -236,294 +700,27 @@ class SlurmProvisioner(KernelProvisionerBase):
             for port in ports:
                 lpc.return_port(port)
 
-    async def get_job_id(self, unique_identifier, retries=5) -> Tuple[str]:
-        sacct_cmd = ["slurmel_allocinfo", unique_identifier]
-        job_info = ""
-        c = 0
-        while not job_info and c < retries:
-            job_info = subprocess.check_output(sacct_cmd).decode()
-            await asyncio.sleep(0.5)
-            c += 1
-
-        if not job_info:
-            error_msg = "Could not receive Job ID for salloc cmd"
-            self.parent.kernel_spec.metadata["error_msg"] = error_msg
-            raise web.HTTPError(400, error_msg)
-
-        return job_info.split(";;;")[0], self.nodeListToListNode(
-            job_info.split(";;;")[1]
-        )
-
-    async def add_allocation_to_kernel_json_file(self):
-        if self.alloc_id is None:
-            return
-        home = os.environ.get("HOME", "")
-        path = (
-            f"{home}/.local/share/jupyter/kernels/slurm-provisioner-kernel/kernel.json"
-        )
-        with open(path, "r") as f:
-            kernel_json = json.load(f)
-        if (
-            "config"
-            in kernel_json.get("metadata", {}).get("kernel_provisioner", {}).keys()
-        ):
-            kernel_json["metadata"]["kernel_provisioner"]["config"][
-                "jobid"
-            ] = self.alloc_id
-        with open(path, "w") as f:
-            f.write(json.dumps(kernel_json, indent=4, sort_keys=True))
-
-    async def allocate_slurm_job(self, km, kernel_config, **kwargs) -> None:
-        unique_identifier = uuid.uuid4().hex
-        salloc_cmd = [
-            "slurmel_allocate",
-            "-a",
-            str(kernel_config["project"]),
-            "-p",
-            str(kernel_config["partition"]),
-            "-n",
-            str(kernel_config["nodes"]),
-            "-t",
-            str(kernel_config["runtime"]),
-            "-i",
-            str(unique_identifier),
-        ]
-        if kernel_config.get("gpus", "0") != "0":
-            salloc_cmd += ["-g", kernel_config["gpus"]]
-        if kernel_config.get("reservation", "None") != "None":
-            salloc_cmd += ["-r", kernel_config["reservation"]]
-
-        # Start allocation, do not wait for it
-        subprocess.check_output(salloc_cmd)
-
-        # Check for jobid, nodelist will be none
-        self.alloc_id, _ = await self.get_job_id(unique_identifier, retries=10)
-
-        # Add Allocation ID to kernel.json file. This way it's reused for the next kernel
-        await self.add_allocation_to_kernel_json_file()
-
-        # Add Slurm-JobID with empty nodelist to local user storage file
-        alloc_dict = self.read_local_storage_file()
-        alloc_dict[self.alloc_id] = {
-            "kernel_ids": [self.kernel_id],
-            "nodelist": [],
-            "endtime": None,
-            "config": kernel_config,
-            "state": "PENDING",
-        }
-        self.write_local_storage_file(alloc_dict)
-
-        # Now we will wait here until the job is running. Then we know the nodelist etc.
-        salloc_wait_cmd = ["slurmel_allocwait", "-i", str(unique_identifier)]
-        self.process = launch_kernel(salloc_wait_cmd, **kwargs)
-
-        # Wait until job is running, so we can check for the node list
-        self.pid = self.process.pid
-        ret = await self.wait(set_process_none=False)
-        if ret != 0:
-            km.kernel_spec.metadata[
-                "error_msg"
-            ] = "Could not allocate slurm allocation. Check JupyterLab logs for more information."
-            return
-
-        # Allocation started succesful, let's get jobid
-        self.alloc_id, self.alloc_listnode = await self.get_job_id(unique_identifier)
-
-        # Add Slurm-JobID with it's nodelist to local user storage file
-        alloc_dict = self.read_local_storage_file()
-        alloc_dict[self.alloc_id]["nodelist"] = self.alloc_listnode
-        alloc_dict[self.alloc_id]["endtime"] = (
-            datetime.now() + timedelta(minutes=int(kernel_config["runtime"]))
-        ).timestamp()
-        alloc_dict[self.alloc_id]["pid"] = None
-        self.write_local_storage_file(alloc_dict)
-
-    async def pre_launch(self, **kwargs: Any) -> Dict[str, Any]:
-        """Perform any steps in preparation for kernel process launch.
-
-        This includes applying additional substitutions to the kernel launch command and env.
-        It also includes preparation of launch parameters.
-
-        Returns the updated kwargs.
-        """
-
-        # This should be considered temporary until a better division of labor can be defined.
-        km = self.parent
-        if km is None:
-            raise web.HTTPError(
-                status_code=400,
-                log_message="Could not load kernel. You should restart JupyterLab and try again.",
-            )
-
-        # Remove errors from previous attempts
-        if "error_msg" in km.kernel_spec.metadata.keys():
-            raise web.HTTPError(
-                status_code=400, log_message=km.kernel_spec.metadata["error_msg"]
-            )
-            # del km.kernel_spec.metadata["error_msg"]
-
-        self.alloc_storage_file = (
-            f"{os.path.dirname(km.connection_file)}/slurm_provisioner.json"
-        )
-        kernel_config = km.kernel_spec.metadata.get("kernel_provisioner", {}).get(
-            "config", {}
-        )
-        required_keys = {"kernel_argv", "project", "partition", "nodes", "runtime"}
-        if not required_keys <= set(kernel_config.keys()):
-            km.kernel_spec.metadata[
-                "error_msg"
-            ] = "Slurm Wrapper not configured correctly. Use the SlurmWrapper sidebar extension to configure this kernel."
-            return {"cmd": "None"}
-
-        km.kernel_spec.argv = kernel_config["kernel_argv"]
-
-        if kernel_config.get("kernel_language", "None") != "None":
-            km.kernel_spec.language = kernel_config["kernel_language"]
-
-        allocate_job = True
-        if kernel_config.get("jobid", "None") != "None":
-            # use preexisting jobid, do not allocate new slurm job
-            job_id_config = str(kernel_config.get("jobid"))
-            sacct_cmd = ["slurmel_jobinfo", job_id_config]
-            job_id = subprocess.check_output(sacct_cmd).decode()
-            if job_id:
-                try:
-                    allocate_job = False
-                    self.alloc_id = job_id
-                    alloc_dict = self.read_local_storage_file()
-                    self.alloc_listnode = alloc_dict[self.alloc_id]["nodelist"]
-                except:
-                    km.kernel_spec.metadata[
-                        "error_msg"
-                    ] = "Could not restart kernel. Check JupyterLab logs for more information."
-                    return {"cmd": "None"}
-            else:
-                km.kernel_spec.metadata[
-                    "error_msg"
-                ] = f"Allocation {job_id_config} is no longer running. You have to start a new kernel. Use the SlurmWrapper sidebar extension to configure it properly."
-                return {"cmd": "None"}
-        if allocate_job:
-            try:
-                await self.allocate_slurm_job(km, kernel_config, **kwargs)
-            except:
-                pass
-            if "error_msg" in km.kernel_spec.metadata.keys():
-                return {"cmd": "None"}
-        if self.alloc_id is None:
-            return {"cmd": "None"}
-        kernel_config["jobid"] = self.alloc_id
-
-        if kernel_config.get("node", "None") != "None":
-            self.node = kernel_config["node"]
-        else:
-            self.node = random.choice(self.alloc_listnode)
-        if self.node not in self.alloc_listnode:
-            self.log.warning(
-                f"Unsupported node selected {self.node} / {self.alloc_listnode}"
-            )
-            self.log.warning("Use random node of listnode")
-            self.node = random.choice(self.alloc_listnode)
-
-        kernel_config["node"] = self.node
-
-        # build the Popen cmd
-        extra_arguments = kwargs.pop("extra_arguments", [])
-
-        # write connection file / get default ports
-        if km.cache_ports and not self.ports_cached:
-            lpc = LocalPortCache.instance()
-            km.ip = "127.0.0.1"
-            km.shell_port = lpc.find_available_port(km.ip)
-            km.iopub_port = lpc.find_available_port(km.ip)
-            km.stdin_port = lpc.find_available_port(km.ip)
-            km.hb_port = lpc.find_available_port(km.ip)
-            km.control_port = lpc.find_available_port(km.ip)
-            self.ports_cached = True
-            # In JSC we need the `i` suffix for internal communication
-            suffix = os.environ.get("SLURM_PROVISIONER_NODE_SUFFIX", "")
-            km.ip = socket.gethostbyname(f"{self.node}{suffix}")
-
-        km.write_connection_file()
-        self.connection_info = km.get_connection_info()
-
-        kernel_cmd = km.format_kernel_cmd(
-            extra_arguments=extra_arguments
-        )  # This needs to remain here for b/c
-        kernel_cmd = [
-            "slurmel_kernel_start",
-            self.alloc_id,
-            self.node,
-            km.kernel_id,
-        ] + kernel_cmd
-        # self.log.info(" ".join(kernel_cmd))
-        try:
-            ret = await super().pre_launch(cmd=kernel_cmd, **kwargs)
-        except:
-            km.kernel_spec.metadata[
-                "error_msg"
-            ] = "Could not allocate slurm job. The JupyterLab log contains more information."
-            return {"cmd": "None"}
-        return ret
-
-    async def launch_kernel(
-        self, cmd: List[str], **kwargs: Any
-    ) -> KernelConnectionInfo:
-        # cmd is kernel.json.argv - kwargs is cwd and env
-        if "error_msg" in self.parent.kernel_spec.metadata.keys():
-            # do nothing. The error will be thrown in self.wait()
-            return self.connection_info
-
-        scrubbed_kwargs = SlurmProvisioner._scrub_kwargs(kwargs)
-        try:
-            self.process = launch_kernel(cmd, **scrubbed_kwargs)
-        except:
-            raise web.HTTPError(
-                400,
-                "Could not start slurm jobstep on allocation. The JupyterLab log contains more information.",
-            )
-
-        self.pid = self.process.pid
-        return self.connection_info
-
-    async def post_launch(self, **kwargs: Any) -> None:
-        if self.alloc_id is None:
-            return
-        if "error_msg" in self.parent.kernel_spec.metadata.keys():
-            # do nothing.
-            return
-        # Add KernelID to local user storage file
-        alloc_dict = self.read_local_storage_file()
-        if self.alloc_id and self.kernel_id not in alloc_dict.get(
-            self.alloc_id, {}
-        ).get("kernel_ids", []):
-            alloc_dict[self.alloc_id]["kernel_ids"].append(self.kernel_id)
-            self.write_local_storage_file(alloc_dict)
-        return await super().post_launch(**kwargs)
-
-    @staticmethod
-    def _scrub_kwargs(kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """Remove any keyword arguments that Popen does not tolerate."""
-        keywords_to_scrub: List[str] = ["extra_arguments", "kernel_id"]
-        scrubbed_kwargs = kwargs.copy()
-        for kw in keywords_to_scrub:
-            scrubbed_kwargs.pop(kw, None)
-        return scrubbed_kwargs
-
-    async def get_provisioner_info(self) -> Dict:
+    async def get_provisioner_info(self):
         """Captures the base information necessary for persistence relative to this instance."""
         provisioner_info = await super().get_provisioner_info()
         provisioner_info.update(
             {
-                "alloc_id": self.alloc_id,
-                "listnode": self.alloc_listnode,
-                "node": self.node,
+                "slurm_allocation_id": self.slurm_allocation_id,
+                "slurm_allocation_name": self.slurm_allocation_name,
+                "slurm_allocation_nodelist": self.slurm_allocation_nodelist,
+                "slurm_allocation_node": self.slurm_allocation_node,
+                "slurm_allocation_endtime": self.slurm_allocation_endtime,
+                "slurm_jobstep_id": self.slurm_jobstep_id,
             }
         )
         return provisioner_info
 
-    async def load_provisioner_info(self, provisioner_info: Dict) -> None:
+    async def load_provisioner_info(self, provisioner_info):
         """Loads the base information necessary for persistence relative to this instance."""
         await super().load_provisioner_info(provisioner_info)
-        self.alloc_id = provisioner_info["alloc_id"]
-        self.alloc_listnode = provisioner_info["listnode"]
-        self.node = provisioner_info["node"]
+        self.slurm_allocation_id = provisioner_info["slurm_allocation_id"]
+        self.slurm_allocation_name = provisioner_info["slurm_allocation_name"]
+        self.slurm_allocation_nodelist = provisioner_info["slurm_allocation_nodelist"]
+        self.slurm_allocation_node = provisioner_info["slurm_allocation_node"]
+        self.slurm_allocation_endtime = provisioner_info["slurm_allocation_endtime"]
+        self.slurm_jobstep_id = provisioner_info["slurm_jobstep_id"]

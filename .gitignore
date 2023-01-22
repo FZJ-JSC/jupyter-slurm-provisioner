@@ -1,3 +1,4 @@
+jupyter_slurm_provisioner/__main__.py
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
