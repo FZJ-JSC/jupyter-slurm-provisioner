@@ -369,12 +369,11 @@ class SlurmProvisioner(KernelProvisionerBase):
         ]
         all_jobs_raw = subprocess.check_output(sacct_cmd).decode().strip()
         all_jobs_tuples = [x.split(";") for x in all_jobs_raw.split("\n")]
-        slurm_jobs_name_list = [
-            x[1] for x in all_jobs_tuples if x[0] == self.slurm_allocation_id
-        ]
-        self.slurm_allocation_name = (
+        slurm_jobs_name_list = [x[1] for x in all_jobs_tuples if x[1] == self.kernel_id]
+        self.slurm_allocation_id = (
             slurm_jobs_name_list[0] if slurm_jobs_name_list else None
         )
+        self.slurm_allocation_name = self.kernel_id
         if not self.slurm_allocation_name:
             raise Exception(
                 f"Allocation {self.slurm_allocation_id} is not running. Shutdown or interrupt this kernel and start a new kernel afterwards. Use the SlurmWrapper sidebar extension to configure it properly."
@@ -382,8 +381,15 @@ class SlurmProvisioner(KernelProvisionerBase):
 
         # Ensure it's stored in storage file
         self.update_alloc_storage_init_allocation()
-        self.slurm_allocation_nodelist = self.kernel_config["nodelist"]
-        self.slurm_allocation_endtime = self.kernel_config["endtime"]
+        storage_file = self.read_local_storage_file()
+        self.slurm_allocation_nodelist = storage_file.get(
+            self.slurm_allocation_id, {}
+        ).get("nodelist", [])
+        self.slurm_allocation_endtime = storage_file.get(
+            self.slurm_allocation_id, {}
+        ).get("endtime", 0)
+        if not self.slurm_allocation_nodelist:
+            await self.slurm_allocation_store_nodelist()
 
     async def slurm_allocate(self):
         # start slurm allocation
@@ -655,7 +661,8 @@ class SlurmProvisioner(KernelProvisionerBase):
             }
             headers = {"Authorization": f"token {jhub_token}"}
             self.log.info("Send metrics to JupyterHub", extra=body)
-            ca_path = os.environ.get("JUPYTERHUB_CERTIFICATE", False)
+            ca_path_env = os.environ.get("JUPYTERHUB_CERTIFICATE", False)
+            ca_path = ca_path_env if ca_path_env else False
             with requests.post(
                 jhub_metrics_url, json=body, headers=headers, verify=ca_path
             ) as r:
