@@ -1,2 +1,2 @@
 #!/bin/bash
-watch --no-title -n 2 "echo 'Overview of your slurm jobs. Cancel with Ctrl+C' && echo \"--------\" && echo \"squeue:\" && squeue -h -u ${USER} && echo \"--------\" && echo \"sacct:\" && sacct -n -s RUNNING && echo \"--------\" "
+watch --no-title -n 2 "echo 'Overview of your slurm jobs. Cancel with Ctrl+C' && echo \"--------\" && echo \"squeue:\" && squeue -h -u ${USER} && echo \"--------\" && echo \"sacct:\" && sacct -n -s RUNNING,PENDING && echo \"--------\" "

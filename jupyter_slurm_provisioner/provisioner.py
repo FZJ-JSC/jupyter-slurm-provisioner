@@ -251,8 +251,34 @@ class SlurmProvisioner(KernelProvisionerBase):
         scancel_cmd = ["scancel", self.slurm_jobstep_id]
         try:
             subprocess.check_output(scancel_cmd)
+        except:
+            self.log.exception("Could not stop jobstep")
         finally:
             self.update_alloc_storage_del_kernel_id()
+
+        self.log.info("Wait for scancel to finish")
+        cancel_time = (datetime.now() + timedelta(seconds=120)).timestamp()
+        while datetime.now().timestamp() < cancel_time:
+            # Wait until jobstep is no longer listed in sacct, but max 120 seconds
+            sacct_cmd = [
+                "sacct",
+                "-o",
+                "jobid",
+                "-n",
+                "-P",
+                "-s",
+                "RUNNING",
+                "--name",
+                str(self.slurm_allocation_name),
+            ]
+            all_steps_list = (
+                subprocess.check_output(sacct_cmd).decode().strip().split("\n")
+            )
+            self.log.info(f"Wait for scancel to finish - {all_steps_list}")
+            if self.slurm_jobstep_id in all_steps_list:
+                await asyncio.sleep(1)
+            else:
+                return
 
     async def slurm_stop_allocation(self, alloc_id):
         # Check if something's still running on this allocation
@@ -322,6 +348,8 @@ class SlurmProvisioner(KernelProvisionerBase):
             if self.slurm_jobstep_id:
                 # scancel command if jobstep id exists
                 await self.slurm_stop_jobstep()
+        except:
+            self.log.exception("Could not stop jobstep")
         finally:
             try:
                 if self.slurm_allocation_id:
@@ -329,6 +357,8 @@ class SlurmProvisioner(KernelProvisionerBase):
                     asyncio.create_task(
                         self.slurm_stop_allocation(self.slurm_allocation_id)
                     )
+            except:
+                self.log.exception("Could not stop allocation")
             finally:
                 self.state = "FINISHED"
 
@@ -356,39 +386,42 @@ class SlurmProvisioner(KernelProvisionerBase):
         # If an slurm_allocation_id is given via config,
         # we verify that it's running (or pending) and
         # store the jobname
-        sacct_cmd = [
-            "sacct",
-            "-o",
-            "jobid,jobname",
-            "-n",
-            "--delimiter",
-            ";",
-            "-P",
-            "-s",
-            "RUNNING,PENDING",
-        ]
-        all_jobs_raw = subprocess.check_output(sacct_cmd).decode().strip()
-        all_jobs_tuples = [x.split(";") for x in all_jobs_raw.split("\n")]
-        slurm_jobs_name_list = [x[1] for x in all_jobs_tuples if x[1] == self.kernel_id]
-        self.slurm_allocation_id = (
-            slurm_jobs_name_list[0] if slurm_jobs_name_list else None
-        )
-        self.slurm_allocation_name = self.kernel_id
         if not self.slurm_allocation_name:
-            raise Exception(
-                f"Allocation {self.slurm_allocation_id} is not running. Shutdown or interrupt this kernel and start a new kernel afterwards. Use the SlurmWrapper sidebar extension to configure it properly."
+            sacct_cmd = [
+                "sacct",
+                "-o",
+                "jobid,jobname",
+                "-n",
+                "--delimiter",
+                ";",
+                "-P",
+                "-s",
+                "RUNNING,PENDING",
+            ]
+            all_jobs_raw = subprocess.check_output(sacct_cmd).decode().strip()
+            all_jobs_tuples = [x.split(";") for x in all_jobs_raw.split("\n")]
+            slurm_jobs_name_list = [
+                x[1] for x in all_jobs_tuples if x[0] == self.slurm_allocation_id
+            ]
+            self.slurm_allocation_name = (
+                slurm_jobs_name_list[0] if slurm_jobs_name_list else None
             )
+            if not self.slurm_allocation_name:
+                raise Exception(
+                    f"Allocation {self.slurm_allocation_id} is not running. Shutdown or interrupt this kernel and start a new kernel afterwards. Use the SlurmWrapper sidebar extension to configure it properly."
+                )
 
         # Ensure it's stored in storage file
         self.update_alloc_storage_init_allocation()
-        storage_file = self.read_local_storage_file()
-        self.slurm_allocation_nodelist = storage_file.get(
-            self.slurm_allocation_id, {}
-        ).get("nodelist", [])
-        self.slurm_allocation_endtime = storage_file.get(
-            self.slurm_allocation_id, {}
-        ).get("endtime", 0)
-        if not self.slurm_allocation_nodelist:
+
+        if (not self.slurm_allocation_nodelist) or (not self.slurm_allocation_endtime):
+            storage_file = self.read_local_storage_file()
+            self.slurm_allocation_nodelist = storage_file.get(
+                self.slurm_allocation_id, {}
+            ).get("nodelist", [])
+            self.slurm_allocation_endtime = storage_file.get(
+                self.slurm_allocation_id, {}
+            ).get("endtime", 0)
             await self.slurm_allocation_store_nodelist()
 
     async def slurm_allocate(self):
@@ -518,7 +551,9 @@ class SlurmProvisioner(KernelProvisionerBase):
             "--name",
             str(self.slurm_allocation_name),
         ]
-        nodelist_raw = subprocess.check_output(sacct_cmd).decode().strip()
+        nodelist_raw = (
+            subprocess.check_output(sacct_cmd).decode().strip().split("\n")[0]
+        )
         # sacct shows nodelist like this:
         # jsfc078
         # jsfc[078-079]
@@ -577,16 +612,17 @@ class SlurmProvisioner(KernelProvisionerBase):
         # on one allocation do not impede each other
         lpc = LocalPortCache.instance()
         km = self.parent
-        km.ip = "127.0.0.1"
-        km.shell_port = lpc.find_available_port(km.ip)
-        km.iopub_port = lpc.find_available_port(km.ip)
-        km.stdin_port = lpc.find_available_port(km.ip)
-        km.hb_port = lpc.find_available_port(km.ip)
-        km.control_port = lpc.find_available_port(km.ip)
-        self.ports_cached = True
-        # For some networks you have to use a suffix for internal communication
-        suffix = os.environ.get("SLURM_PROVISIONER_NODE_SUFFIX", "")
-        km.ip = socket.gethostbyname(f"{self.slurm_allocation_node}{suffix}")
+        if km.cache_ports and not self.ports_cached:
+            km.ip = "127.0.0.1"
+            km.shell_port = lpc.find_available_port(km.ip)
+            km.iopub_port = lpc.find_available_port(km.ip)
+            km.stdin_port = lpc.find_available_port(km.ip)
+            km.hb_port = lpc.find_available_port(km.ip)
+            km.control_port = lpc.find_available_port(km.ip)
+            self.ports_cached = True
+            # For some networks you have to use a suffix for internal communication
+            suffix = os.environ.get("SLURM_PROVISIONER_NODE_SUFFIX", "")
+            km.ip = socket.gethostbyname(f"{self.slurm_allocation_node}{suffix}")
         km.write_connection_file()
         self.connection_info = km.get_connection_info()
 
@@ -636,14 +672,24 @@ class SlurmProvisioner(KernelProvisionerBase):
             "--name",
             str(self.slurm_allocation_name),
         ]
-        all_steps_raw = subprocess.check_output(sacct_cmd).decode().strip()
-        all_steps_tuples = [x.split(";") for x in all_steps_raw.split("\n")]
-        slurm_jobstep_id_list = [
-            x[0] for x in all_steps_tuples if x[1] == self.kernel_id
-        ]
-        self.slurm_jobstep_id = (
-            slurm_jobstep_id_list[0] if slurm_jobstep_id_list else None
-        )
+        self.log.info("Wait for jobstep to be listed")
+        cancel_time = (datetime.now() + timedelta(seconds=120)).timestamp()
+        while datetime.now().timestamp() < cancel_time:
+            # Wait until jobstep is no longer listed in sacct, but max 120 seconds
+            all_steps_raw = subprocess.check_output(sacct_cmd).decode().strip()
+            all_steps_tuples = [x.split(";") for x in all_steps_raw.split("\n")]
+            slurm_jobstep_id_list = [
+                x[0] for x in all_steps_tuples if x[1] == self.kernel_id
+            ]
+            self.log.info(f"Wait for jobstep to be listed - {all_steps_tuples}")
+            if not slurm_jobstep_id_list:
+                await asyncio.sleep(1)
+            else:
+                self.slurm_jobstep_id = (
+                    slurm_jobstep_id_list[-1] if slurm_jobstep_id_list else None
+                )
+                return
+        raise Exception("Could not receive slurm jobid for kernel")
 
     async def send_metric_to_jhub(self):
         jhub_metrics_url = os.environ.get("SLURM_PROVISIONER_JHUB_METRICS", "")
@@ -696,7 +742,7 @@ class SlurmProvisioner(KernelProvisionerBase):
         restart is True if this operation precedes a start launch_kernel request.
         """
         lpc = LocalPortCache.instance()
-        if "shell_port" in self.connection_info:
+        if self.ports_cached and "shell_port" in self.connection_info and not restart:
             ports = (
                 self.connection_info["shell_port"],
                 self.connection_info["iopub_port"],
