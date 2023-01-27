@@ -20,9 +20,6 @@ on any partition, while their notebook server is running on an
 interactive login node. This offers a separation between code execution
 and user interface. The slurm provisioner will not use its ipykernel
 argv configuration but is meant to be a wrapper for any existing kernel.
-It is recommended to use this kernel with the option
-```--KernelRestarter.restart_limit=0`` <https://github.com/jupyter/jupyter_client/blob/v7.4.2/jupyter_client/restarter.py#L43>`__
-to avoid unsought compute time and costs.
 
 Configuration
 -------------
@@ -80,4 +77,3 @@ Example ``kernel.json``
            }
        }
    }
-
