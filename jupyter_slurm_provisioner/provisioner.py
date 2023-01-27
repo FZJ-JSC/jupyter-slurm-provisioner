@@ -72,6 +72,8 @@ class SlurmProvisioner(KernelProvisionerBase):
     slurm_allocation_node = None
     slurm_allocation_endtime = None
     slurm_jobstep_id = None
+    slurm_launch_kernel_process = None
+    slurm_salloc_process = None
 
     alloc_storage_file = None
 
@@ -329,8 +331,15 @@ class SlurmProvisioner(KernelProvisionerBase):
             if self.slurm_salloc_process:
                 # If it's currently allocating slurm resources: kill this process
                 self.slurm_salloc_process.kill()
+                # Make sure all the fds get closed.
+                for attr in ["stdout", "stderr", "stdin"]:
+                    fid = getattr(self.slurm_salloc_process, attr)
+                    if fid:
+                        fid.close()
         except:
             self.log.exception("Could not kill allocation process")
+        finally:
+            self.slurm_salloc_process = None
         try:
             if self.slurm_launch_kernel_process:
                 # If it's currently allocating slurm resources: kill this process
@@ -360,6 +369,7 @@ class SlurmProvisioner(KernelProvisionerBase):
             except:
                 self.log.exception("Could not stop allocation")
             finally:
+                self.log.debug("Set state to FINISHED")
                 self.state = "FINISHED"
 
     async def terminate(self, restart=False):
@@ -377,6 +387,7 @@ class SlurmProvisioner(KernelProvisionerBase):
 
     async def pre_launch(self, **kwargs):
         # ensure that an allocation is up and running
+        self.log.debug("Set state to PRE_LAUNCH")
         self.state = "PRE_LAUNCH"
         ret = await super().pre_launch(**kwargs)
         ret["cmd"] = None
@@ -424,6 +435,9 @@ class SlurmProvisioner(KernelProvisionerBase):
             ).get("endtime", 0)
             await self.slurm_allocation_store_nodelist()
 
+        # Wait until it's up and running
+        await self.slurm_allocation_running()
+
     async def slurm_allocate(self):
         # start slurm allocation
         # Do not run anything on it yet
@@ -446,6 +460,7 @@ class SlurmProvisioner(KernelProvisionerBase):
         }
 
         self.slurm_allocation_name = uuid.uuid4().hex
+
         salloc_cmd = [
             "salloc",
             "--no-shell",
@@ -468,17 +483,6 @@ class SlurmProvisioner(KernelProvisionerBase):
             salloc_cmd += ["--reservation", str(self.kernel_config["reservation"])]
 
         self.slurm_salloc_process = start_popen(salloc_cmd)
-        exit_code = self.slurm_salloc_process.wait()
-        # Make sure all the fds get closed.
-        for attr in ["stdout", "stderr", "stdin"]:
-            fid = getattr(self.slurm_salloc_process, attr)
-            if fid:
-                fid.close()
-        self.slurm_salloc_process = None
-        if exit_code != 0:
-            raise Exception(
-                "Could not create slurm allocation. Check JupyterLab logs for more information."
-            )
 
         # Get JobID for defined job-name
         squeue_cmd = [
@@ -489,10 +493,30 @@ class SlurmProvisioner(KernelProvisionerBase):
             "--name",
             str(self.slurm_allocation_name),
         ]
-        self.slurm_allocation_id = subprocess.check_output(squeue_cmd).decode().strip()
+
+        self.log.info("Wait for allocation to be listed")
+        cancel_time = (datetime.now() + timedelta(seconds=120)).timestamp()
+        while datetime.now().timestamp() < cancel_time:
+            output = subprocess.check_output(squeue_cmd).decode().strip()
+            if output:
+                self.slurm_allocation_id = output
+                break
+            else:
+                await asyncio.sleep(1)
 
         # Ensure it's stored in storage file
         self.update_alloc_storage_init_allocation()
+
+        # Wait until it's up and running
+        await self.slurm_allocation_running()
+
+        self.slurm_salloc_process.wait()
+        # Make sure all the fds get closed.
+        for attr in ["stdout", "stderr", "stdin"]:
+            fid = getattr(self.slurm_salloc_process, attr)
+            if fid:
+                fid.close()
+        self.slurm_salloc_process = None
 
     async def slurm_allocation_running(self):
         # Wait for slurm allocation until it's running
@@ -538,6 +562,7 @@ class SlurmProvisioner(KernelProvisionerBase):
             else:
                 # Check again in 5 seconds
                 await asyncio.sleep(5)
+        return
 
     async def slurm_allocation_store_nodelist(self):
         sacct_cmd = [
@@ -640,22 +665,22 @@ class SlurmProvisioner(KernelProvisionerBase):
                 await self.slurm_allocate()
             else:
                 await self.slurm_verify_allocation()
-            await self.slurm_allocation_running()
             await self.slurm_allocation_store_nodelist()
         except Exception as e:
             self.log.exception("Exception in pre_launch")
+            self.log.debug("Set state to FAILED")
             self.state = "FAILED"
             raise Exception(str(e))
-
+        self.log.debug("Set state to LAUNCH")
         self.state = "LAUNCH"
         try:
             await self.slurm_launch_kernel()
             await self.set_connection_info()
         except Exception as e:
             self.log.exception("Excpetion in launch_kernel.")
+            self.log.debug("Set state to FAILED")
             self.state = "FAILED"
             raise Exception(str(e))
-
         return self.connection_info
 
     async def slurm_set_jobstep_id(self):
@@ -715,11 +740,13 @@ class SlurmProvisioner(KernelProvisionerBase):
                 r.raise_for_status()
 
     async def post_launch(self, **kwargs):
+        self.log.debug("Set state to POST_LAUNCH")
         self.state = "POST_LAUNCH"
         try:
             await self.slurm_set_jobstep_id()
         except Exception as e:
             self.log.exception("Excpetion in post_launch.")
+            self.log.debug("Set state to FAILED")
             self.state = "FAILED"
             raise Exception(str(e))
         try:
@@ -729,7 +756,7 @@ class SlurmProvisioner(KernelProvisionerBase):
                 "Could not send metric to JupyterHub. Start Kernel anyway",
                 exc_info=True,
             )
-
+        self.log.debug("Set state to RUNNING")
         self.state = "RUNNING"
 
     async def cleanup(self, restart=False):
